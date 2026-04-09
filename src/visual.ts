@@ -13,22 +13,8 @@ import DataView                 = powerbi.DataView;
 
 import { VisualFormattingSettingsModel } from "./settings";
 
-// ---- Canvas 定数 ----
-const ROW_H    = 22;
-const HEADER_H = 28;
-const CB_W     = 26;   // チェックボックス列幅
-const SB_W     = 10;   // スクロールバー幅
-const PAD      = 8;
-const FONT     = "12px 'Segoe UI',sans-serif";
-const FONT_HDR = "600 12px 'Segoe UI',sans-serif";
-
-const C = {
-    hdrBg:   "#f2f2f2", rowEven: "#ffffff", rowOdd: "#fafafa",
-    rowHov:  "#e8f4fd", rowSel:  "#deecf9",
-    text:    "#252423", border:  "#e0e0e0", hdrLine: "#d1d1d1",
-    sbTrack: "#f0f0f0", sbThumb: "#c8c8c8",
-    cbBorder:"#8a8886", cbFill:  "#0078d4", cbCheck: "#ffffff",
-};
+const ROW_H  = 24;   // px（tbody 行の高さ）
+const BUFFER = 8;    // ビューポート外に余分に描画しておく行数
 
 interface FilterCondition {
     columnIndex: number;
@@ -54,7 +40,7 @@ export class Visual implements IVisual {
     private appliedConditions: FilterCondition[] = [];
     private appliedLogic: "AND" | "OR"           = "AND";
     private filteredRows: string[][]             = [];
-    private filteredOrigIdx: number[]            = [];   // filteredRows[i] → tableData.rows の元インデックス
+    private filteredOrigIdx: number[]            = [];
     private selectionIds: powerbi.visuals.ISelectionId[] = [];
     private selectedOrigIdx: Set<number>         = new Set();
     private visibleCols: boolean[]               = [];
@@ -63,26 +49,17 @@ export class Visual implements IVisual {
     private filterPanel:  HTMLElement;
     private colToggleBar: HTMLElement;
     private statusBar:    HTMLElement;
-    private canvasArea:   HTMLElement;
-    private canvas:       HTMLCanvasElement;
-    private ctx:          CanvasRenderingContext2D;
+    private tableWrapper: HTMLElement;
+    private scrollEl:     HTMLElement;
+    private table:        HTMLTableElement;
+    private colGroup:     HTMLElement;
+    private thead:        HTMLTableSectionElement;
+    private tbody:        HTMLTableSectionElement;
 
-    // ---- Canvas 状態 ----
-    private scrollTop   = 0;
-    private hoveredRow  = -1;
-    private colWidths:    number[] = [];
-    private logicalW    = 0;
-    private logicalH    = 0;
-    private drawPending = false;
-
-    // ---- スクロールバードラッグ ----
-    private isDragging      = false;
-    private dragStartY      = 0;
-    private dragStartScroll = 0;
-
-    // ---- 自分の persist サイクルをスキップ ----
+    // ---- 制御フラグ ----
     private skipRender   = false;
     private persistTimer: number | null = null;
+    private scrollRaf:    number | null = null;
 
     constructor(options: VisualConstructorOptions) {
         this.host = options.host;
@@ -90,24 +67,37 @@ export class Visual implements IVisual {
         this.selectionManager = options.host.createSelectionManager();
         options.element.className = "filter-table-visual";
         this.buildDOM(options.element);
-        this.setupCanvasEvents();
     }
 
     private buildDOM(root: HTMLElement): void {
         this.filterPanel  = this.el("div", "filter-panel");
         this.colToggleBar = this.el("div", "col-toggle-bar");
         this.statusBar    = this.el("div", "status-bar");
-        this.canvasArea   = this.el("div", "canvas-area");
-        this.canvas       = this.el("canvas", "") as HTMLCanvasElement;
-        this.ctx          = this.canvas.getContext("2d");
-        this.canvasArea.appendChild(this.canvas);
-        [this.filterPanel, this.colToggleBar, this.statusBar, this.canvasArea]
+        this.tableWrapper = this.el("div", "table-wrapper");
+        this.scrollEl     = this.el("div", "table-scroll");
+        this.table        = this.el("table", "data-table") as HTMLTableElement;
+        this.colGroup     = this.el("colgroup", "");
+        this.thead        = this.el("thead", "") as HTMLTableSectionElement;
+        this.tbody        = this.el("tbody", "") as HTMLTableSectionElement;
+
+        this.table.appendChild(this.colGroup);
+        this.table.appendChild(this.thead);
+        this.table.appendChild(this.tbody);
+        this.scrollEl.appendChild(this.table);
+        this.tableWrapper.appendChild(this.scrollEl);
+        [this.filterPanel, this.colToggleBar, this.statusBar, this.tableWrapper]
             .forEach(e => root.appendChild(e));
+
+        this.scrollEl.addEventListener("scroll", () => {
+            if (this.scrollRaf !== null) cancelAnimationFrame(this.scrollRaf);
+            this.scrollRaf = requestAnimationFrame(() => {
+                this.scrollRaf = null;
+                this.renderVirtualRows();
+            });
+        });
     }
 
-    private el<K extends keyof HTMLElementTagNameMap>(
-        tag: K, cls: string
-    ): HTMLElementTagNameMap[K] {
+    private el<K extends keyof HTMLElementTagNameMap>(tag: K, cls: string): HTMLElementTagNameMap[K] {
         const e = document.createElement(tag);
         if (cls) e.className = cls;
         return e;
@@ -129,41 +119,38 @@ export class Visual implements IVisual {
         // 自分の persist による update はパネルのみ更新してスキップ
         if (this.skipRender) {
             this.skipRender = false;
-            if (!this.filterPanel.querySelector("input:focus")) this.renderFilterPanel();
+            if (!this.filterPanel.querySelector(".value-input:focus")) this.renderFilterPanel();
             return;
         }
 
         this.tableData = this.extractTableData(dv);
         this.buildSelectionIds(dv);
 
-        // 列が増えた分は true、減った分は切り詰め（既存の表示設定を保持）
+        // 列が増えた分は true で追加、既存の表示設定を保持
         if (this.visibleCols.length !== this.tableData.columns.length) {
             this.visibleCols = this.tableData.columns.map((_, i) =>
                 this.visibleCols[i] !== undefined ? this.visibleCols[i] : true
             );
         }
 
-        if (!this.filterPanel.querySelector("input:focus")) {
+        if (!this.filterPanel.querySelector(".value-input:focus")) {
             this.restoreState(dv);
             this.renderFilterPanel();
         }
 
         this.renderColToggleBar();
         this.runFilter();
-        this.scrollTop = 0;
+        this.renderTableHeader();
+        this.scrollEl.scrollTop = 0;
+        this.renderVirtualRows();
         this.renderStatus();
-        this.resizeCanvas();
-        this.scheduleRedraw();
     }
 
     private restoreState(dv: DataView): void {
         const m   = dv?.metadata?.objects?.["filterState"];
         const len = this.tableData.columns.length;
-
-        // 列数を超える columnIndex の条件は除外（列を削減したときの不整合対策）
         const sanitize = (arr: FilterCondition[]) =>
             arr.filter(c => c.columnIndex >= 0 && c.columnIndex < len);
-
         try   { this.conditions = sanitize(m?.["conditions"] ? JSON.parse(m["conditions"] as string) : []); }
         catch { this.conditions = []; }
         this.logic = (m?.["logic"] as string) === "OR" ? "OR" : "AND";
@@ -191,12 +178,11 @@ export class Visual implements IVisual {
     }
 
     // ==========================================================
-    // フィルターパネル（HTML DOM）
+    // フィルターパネル
     // ==========================================================
     private renderFilterPanel(): void {
         this.clear(this.filterPanel);
 
-        // ヘッダー（タイトル + AND/OR）
         const hdr = this.el("div", "filter-header");
         const ttl = this.el("span", "filter-title");
         ttl.textContent = "フィルター";
@@ -212,12 +198,10 @@ export class Visual implements IVisual {
         hdr.appendChild(tog);
         this.filterPanel.appendChild(hdr);
 
-        // 条件リスト
         const list = this.el("div", "condition-list");
         this.conditions.forEach((c, i) => list.appendChild(this.makeConditionRow(c, i)));
         this.filterPanel.appendChild(list);
 
-        // フッター（追加 / 解除 / 実行）
         const footer = this.el("div", "filter-footer");
 
         const addBtn = this.el("button", "add-condition-btn");
@@ -227,10 +211,10 @@ export class Visual implements IVisual {
             this.saveState(); this.renderFilterPanel();
         };
 
-        const clearBtn = this.el("button", "clear-btn");
+        const clearBtn = this.el("button", "clear-btn") as HTMLButtonElement;
         clearBtn.textContent = "解除";
         clearBtn.title = "フィルターを解除して全件表示";
-        (clearBtn as HTMLButtonElement).disabled = this.appliedConditions.length === 0;
+        clearBtn.disabled = this.appliedConditions.length === 0;
         clearBtn.onclick = () => this.clearFilter();
 
         const runBtn = this.el("button", "run-btn");
@@ -289,32 +273,37 @@ export class Visual implements IVisual {
             chip.textContent = col;
             chip.title = this.visibleCols[i] ? "非表示にする" : "表示する";
             chip.onclick = () => {
-                const visCount = this.visibleCols.filter(Boolean).length;
-                if (visCount === 1 && this.visibleCols[i]) return; // 最後の1列は守る
+                if (this.visibleCols.filter(Boolean).length === 1 && this.visibleCols[i]) return;
                 this.visibleCols[i] = !this.visibleCols[i];
                 chip.className = "col-chip" + (this.visibleCols[i] ? " active" : "");
                 chip.title = this.visibleCols[i] ? "非表示にする" : "表示する";
-                this.calcColWidths(this.logicalW - SB_W - CB_W);
-                this.scheduleRedraw();
+                this.renderTableHeader();
+                this.renderVirtualRows();
             };
             this.colToggleBar.appendChild(chip);
         });
     }
 
     // ==========================================================
-    // 検索ロジック
+    // 検索
     // ==========================================================
     private executeSearch(): void {
         this.appliedConditions = this.conditions.map(c => ({ ...c }));
         this.appliedLogic = this.logic;
-        this.runFilter(); this.scrollTop = 0;
-        this.persist(); this.renderFilterPanel(); this.renderStatus(); this.scheduleRedraw();
+        this.runFilter();
+        this.renderTableHeader();
+        this.scrollEl.scrollTop = 0;
+        this.renderVirtualRows();
+        this.persist(); this.renderFilterPanel(); this.renderStatus();
     }
 
     private clearFilter(): void {
         this.appliedConditions = []; this.appliedLogic = "AND";
-        this.runFilter(); this.scrollTop = 0;
-        this.persist(); this.renderFilterPanel(); this.renderStatus(); this.scheduleRedraw();
+        this.runFilter();
+        this.renderTableHeader();
+        this.scrollEl.scrollTop = 0;
+        this.renderVirtualRows();
+        this.persist(); this.renderFilterPanel(); this.renderStatus();
     }
 
     private runFilter(): void {
@@ -334,28 +323,150 @@ export class Visual implements IVisual {
     }
 
     // ==========================================================
-    // 選択（クロスフィルター）
+    // テーブル描画（DOM仮想スクロール）
     // ==========================================================
-    private toggleRowSelection(fi: number): void {
-        const oi = this.filteredOrigIdx[fi];
+    private renderTableHeader(): void {
+        this.clear(this.colGroup);
+        this.clear(this.thead);
+        if (!this.tableData.columns.length) return;
+
+        // colgroup（チェックボックス列 + データ列）
+        const cbCol = this.el("col", ""); cbCol.style.width = "32px";
+        this.colGroup.appendChild(cbCol);
+        this.tableData.columns.forEach((_, i) => {
+            if (this.visibleCols[i]) this.colGroup.appendChild(this.el("col", ""));
+        });
+
+        // thead 行
+        const tr = this.el("tr", "");
+
+        const cbTh = this.el("th", "cb-col");
+        const allSel = this.filteredOrigIdx.length > 0
+            && this.filteredOrigIdx.every(i => this.selectedOrigIdx.has(i));
+        const someSel = !allSel && this.filteredOrigIdx.some(i => this.selectedOrigIdx.has(i));
+        const allCb = this.el("input", "") as HTMLInputElement;
+        allCb.type = "checkbox"; allCb.checked = allSel; allCb.indeterminate = someSel;
+        allCb.onchange = () => this.toggleSelectAll();
+        cbTh.appendChild(allCb);
+        tr.appendChild(cbTh);
+
+        this.tableData.columns.forEach((col, i) => {
+            if (!this.visibleCols[i]) return;
+            const th = this.el("th", ""); th.textContent = col;
+            tr.appendChild(th);
+        });
+        this.thead.appendChild(tr);
+    }
+
+    private renderVirtualRows(): void {
+        const scrollTop = this.scrollEl.scrollTop;
+        const viewH     = this.scrollEl.clientHeight;
+        const total     = this.filteredRows.length;
+
+        if (total === 0) {
+            this.clear(this.tbody);
+            const tr = this.el("tr", ""); const td = this.el("td", "no-data") as HTMLTableCellElement;
+            const visCols = this.tableData.columns.filter((_, i) => this.visibleCols[i]).length;
+            td.colSpan = visCols + 1;
+            td.textContent = this.tableData.columns.length === 0
+                ? "データをフィールドに追加してください"
+                : "該当するデータがありません";
+            tr.appendChild(td); this.tbody.appendChild(tr);
+            return;
+        }
+
+        const startRow = Math.max(0, Math.floor(scrollTop / ROW_H) - BUFFER);
+        const endRow   = Math.min(total, startRow + Math.ceil(viewH / ROW_H) + BUFFER * 2);
+        const beforeH  = startRow * ROW_H;
+        const afterH   = Math.max(0, (total - endRow) * ROW_H);
+        const span     = this.tableData.columns.filter((_, i) => this.visibleCols[i]).length + 1;
+
+        this.clear(this.tbody);
+        const frag = document.createDocumentFragment();
+
+        if (beforeH > 0) frag.appendChild(this.makeSpacerRow(beforeH, span));
+        for (let ri = startRow; ri < endRow; ri++) frag.appendChild(this.makeDataRow(ri));
+        if (afterH  > 0) frag.appendChild(this.makeSpacerRow(afterH,  span));
+
+        this.tbody.appendChild(frag);
+    }
+
+    private makeSpacerRow(h: number, span: number): HTMLTableRowElement {
+        const tr = this.el("tr", "spacer-row") as HTMLTableRowElement;
+        const td = this.el("td", "") as HTMLTableCellElement;
+        td.colSpan = span; td.style.height = h + "px";
+        td.style.padding = "0"; td.style.border = "none";
+        tr.appendChild(td);
+        return tr;
+    }
+
+    private makeDataRow(ri: number): HTMLTableRowElement {
+        const oi  = this.filteredOrigIdx[ri];
+        const sel = this.selectedOrigIdx.has(oi);
+        const tr  = this.el("tr", ri % 2 === 0 ? "row-even" : "row-odd") as HTMLTableRowElement;
+        tr.dataset.ri = String(ri);
+        if (sel) tr.classList.add("row-selected");
+
+        const cbTd = this.el("td", "cb-col") as HTMLTableCellElement;
+        const cb   = this.el("input", "") as HTMLInputElement;
+        cb.type = "checkbox"; cb.checked = sel;
+        cb.onchange = () => this.toggleRowSelection(ri);
+        cbTd.appendChild(cb); tr.appendChild(cbTd);
+
+        const row = this.filteredRows[ri];
+        this.tableData.columns.forEach((_, i) => {
+            if (!this.visibleCols[i]) return;
+            const td = this.el("td", "") as HTMLTableCellElement;
+            td.textContent = row[i] ?? "";
+            tr.appendChild(td);
+        });
+        return tr;
+    }
+
+    // ==========================================================
+    // 選択
+    // ==========================================================
+    private toggleRowSelection(ri: number): void {
+        if (ri >= this.filteredOrigIdx.length) return;
+        const oi = this.filteredOrigIdx[ri];
         this.selectedOrigIdx.has(oi) ? this.selectedOrigIdx.delete(oi) : this.selectedOrigIdx.add(oi);
         this.commitSelection();
     }
 
     private toggleSelectAll(): void {
         const allSel = this.filteredOrigIdx.every(i => this.selectedOrigIdx.has(i));
-        this.filteredOrigIdx.forEach(i => allSel ? this.selectedOrigIdx.delete(i) : this.selectedOrigIdx.add(i));
+        this.filteredOrigIdx.forEach(i =>
+            allSel ? this.selectedOrigIdx.delete(i) : this.selectedOrigIdx.add(i)
+        );
         this.commitSelection();
     }
 
-    private clearSelection(): void {
-        this.selectedOrigIdx.clear(); this.commitSelection();
-    }
+    private clearSelection(): void { this.selectedOrigIdx.clear(); this.commitSelection(); }
 
     private commitSelection(): void {
         const ids = Array.from(this.selectedOrigIdx).map(i => this.selectionIds[i]).filter(Boolean);
         ids.length ? this.selectionManager.select(ids) : this.selectionManager.clear();
-        this.renderStatus(); this.scheduleRedraw();
+        this.updateSelectionUI();
+        this.renderStatus();
+    }
+
+    // 選択変更時：全行再生成せず、可視行のチェックボックスだけ更新
+    private updateSelectionUI(): void {
+        this.tbody.querySelectorAll("tr[data-ri]").forEach((el: Element) => {
+            const ri  = parseInt((el as HTMLElement).dataset.ri, 10);
+            const oi  = this.filteredOrigIdx[ri];
+            const sel = this.selectedOrigIdx.has(oi);
+            const cb  = el.querySelector("input") as HTMLInputElement;
+            if (cb) cb.checked = sel;
+            (el as HTMLElement).classList.toggle("row-selected", sel);
+        });
+        const allCb = this.thead.querySelector("input") as HTMLInputElement;
+        if (allCb) {
+            const allSel = this.filteredOrigIdx.length > 0
+                && this.filteredOrigIdx.every(i => this.selectedOrigIdx.has(i));
+            const someSel = !allSel && this.filteredOrigIdx.some(i => this.selectedOrigIdx.has(i));
+            allCb.checked = allSel; allCb.indeterminate = someSel;
+        }
     }
 
     // ==========================================================
@@ -364,9 +475,7 @@ export class Visual implements IVisual {
     private renderStatus(): void {
         this.clear(this.statusBar);
         const f = this.filteredRows.length, t = this.tableData.rows.length;
-        this.statusBar.appendChild(
-            document.createTextNode(f === t ? `${t} 件` : `${f} / ${t} 件`)
-        );
+        this.statusBar.appendChild(document.createTextNode(f === t ? `${t} 件` : `${f} / ${t} 件`));
         if (this.selectedOrigIdx.size > 0) {
             const info = this.el("span", "sel-info");
             info.textContent = `　${this.selectedOrigIdx.size} 件選択中`;
@@ -394,210 +503,6 @@ export class Visual implements IVisual {
             conditions: JSON.stringify(this.conditions), logic: this.logic,
             applied: JSON.stringify(this.appliedConditions), appliedLogic: this.appliedLogic,
         }}]});
-    }
-
-    // ==========================================================
-    // Canvas
-    // ==========================================================
-    private resizeCanvas(): void {
-        const w = this.canvasArea.clientWidth, h = this.canvasArea.clientHeight;
-        if (w <= 0 || h <= 0) return;
-        const dpr = window.devicePixelRatio || 1;
-        this.canvas.width  = Math.round(w * dpr); this.canvas.height = Math.round(h * dpr);
-        this.canvas.style.width  = w + "px";       this.canvas.style.height = h + "px";
-        this.logicalW = w; this.logicalH = h;
-        this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        this.calcColWidths(w - SB_W - CB_W);
-    }
-
-    private calcColWidths(availW: number): void {
-        const vis = this.tableData.columns.map((_, i) => i).filter(i => this.visibleCols[i]);
-        if (!vis.length || availW <= 0) { this.colWidths = this.tableData.columns.map(() => 0); return; }
-
-        const ctx = this.ctx;
-        const ws: Record<number, number> = {};
-        ctx.font = FONT_HDR;
-        vis.forEach(i => {
-            ws[i] = Math.min(280, Math.max(50, ctx.measureText(this.tableData.columns[i]).width + PAD * 2 + 12));
-        });
-        ctx.font = FONT;
-        for (const row of this.filteredRows.slice(0, 300)) {
-            vis.forEach(i => {
-                const w = Math.min(280, ctx.measureText(row[i] ?? "").width + PAD * 2);
-                if (w > ws[i]) ws[i] = w;
-            });
-        }
-
-        const total = vis.reduce((s, i) => s + ws[i], 0);
-        if (total <= availW) {
-            // 余白を均等配分
-            const extra = (availW - total) / vis.length;
-            vis.forEach(i => ws[i] += extra);
-        } else {
-            // 列が多すぎる場合は比率で縮小（最小 40px を保証）
-            const scale = availW / total;
-            vis.forEach(i => { ws[i] = Math.max(40, Math.floor(ws[i] * scale)); });
-        }
-
-        this.colWidths = this.tableData.columns.map((_, i) => ws[i] ?? 0);
-    }
-
-    private scheduleRedraw(): void {
-        if (this.drawPending) return;
-        this.drawPending = true;
-        requestAnimationFrame(() => { this.drawPending = false; this.draw(); });
-    }
-
-    private maxScroll(): number {
-        return Math.max(0, this.filteredRows.length * ROW_H - (this.logicalH - HEADER_H));
-    }
-
-    // ---- メイン描画 ----
-    private draw(): void {
-        const ctx = this.ctx, W = this.logicalW, H = this.logicalH;
-        if (W <= 0 || H <= 0) return;
-        ctx.clearRect(0, 0, W, H);
-        if (!this.tableData.columns.length) {
-            ctx.fillStyle = "#a19f9d"; ctx.font = FONT; ctx.textAlign = "center"; ctx.textBaseline = "middle";
-            ctx.fillText("データをフィールドに追加してください", W / 2, H / 2);
-            return;
-        }
-        const tW = W - SB_W;
-        this.drawHeader(ctx, tW); this.drawBody(ctx, tW); this.drawScrollbar(ctx, W, H);
-        ctx.strokeStyle = C.hdrLine; ctx.lineWidth = 1;
-        ctx.beginPath(); ctx.moveTo(0, HEADER_H); ctx.lineTo(tW, HEADER_H); ctx.stroke();
-    }
-
-    private drawHeader(ctx: CanvasRenderingContext2D, tW: number): void {
-        ctx.fillStyle = C.hdrBg; ctx.fillRect(0, 0, tW, HEADER_H);
-
-        // 全選択チェックボックス
-        const allSel = this.filteredOrigIdx.length > 0
-            && this.filteredOrigIdx.every(i => this.selectedOrigIdx.has(i));
-        const someSel = !allSel && this.filteredOrigIdx.some(i => this.selectedOrigIdx.has(i));
-        this.drawCB(ctx, (CB_W - 14) / 2, (HEADER_H - 14) / 2, allSel, someSel);
-
-        ctx.font = FONT_HDR; ctx.fillStyle = C.text; ctx.textBaseline = "middle"; ctx.textAlign = "left";
-        const vis = this.tableData.columns.map((_, i) => i).filter(i => this.visibleCols[i]);
-        let x = CB_W;
-        vis.forEach(i => {
-            const cw = this.colWidths[i] ?? 0;
-            if (cw <= 0) return;
-            ctx.save(); ctx.beginPath(); ctx.rect(x + PAD, 0, cw - PAD * 2, HEADER_H); ctx.clip();
-            ctx.fillText(this.tableData.columns[i], x + PAD, HEADER_H / 2); ctx.restore();
-            ctx.strokeStyle = C.hdrLine; ctx.lineWidth = 1;
-            ctx.beginPath(); ctx.moveTo(x + cw - 0.5, 4); ctx.lineTo(x + cw - 0.5, HEADER_H - 4); ctx.stroke();
-            x += cw;
-        });
-    }
-
-    private drawBody(ctx: CanvasRenderingContext2D, tW: number): void {
-        const bodyH = this.logicalH - HEADER_H;
-        const first = Math.floor(this.scrollTop / ROW_H);
-        const last  = Math.min(this.filteredRows.length, first + Math.ceil(bodyH / ROW_H) + 1);
-        const vis   = this.tableData.columns.map((_, i) => i).filter(i => this.visibleCols[i]);
-
-        ctx.save(); ctx.beginPath(); ctx.rect(0, HEADER_H, tW, bodyH); ctx.clip();
-        ctx.font = FONT; ctx.textBaseline = "middle"; ctx.textAlign = "left";
-
-        for (let ri = first; ri < last; ri++) {
-            if (ri >= this.filteredOrigIdx.length) break;   // 境界保護
-            const y   = HEADER_H + ri * ROW_H - this.scrollTop;
-            const oi  = this.filteredOrigIdx[ri];
-            const sel = this.selectedOrigIdx.has(oi);
-
-            ctx.fillStyle = sel ? C.rowSel : (ri === this.hoveredRow ? C.rowHov : (ri % 2 === 0 ? C.rowEven : C.rowOdd));
-            ctx.fillRect(0, y, tW, ROW_H);
-            ctx.strokeStyle = C.border; ctx.lineWidth = 1;
-            ctx.beginPath(); ctx.moveTo(0, y + ROW_H); ctx.lineTo(tW, y + ROW_H); ctx.stroke();
-
-            this.drawCB(ctx, (CB_W - 14) / 2, y + (ROW_H - 14) / 2, sel, false);
-
-            ctx.fillStyle = C.text;
-            let x = CB_W;
-            const row = this.filteredRows[ri];
-            vis.forEach(i => {
-                const cw = this.colWidths[i] ?? 0;
-                if (cw <= 0) return;
-                ctx.save(); ctx.beginPath(); ctx.rect(x + PAD, y, cw - PAD * 2, ROW_H); ctx.clip();
-                ctx.fillText(row[i] ?? "", x + PAD, y + ROW_H / 2); ctx.restore();
-                x += cw;
-            });
-        }
-        ctx.restore();
-    }
-
-    private drawCB(ctx: CanvasRenderingContext2D, x: number, y: number, checked: boolean, indeterminate: boolean): void {
-        const s = 14;
-        ctx.fillStyle   = checked ? C.cbFill : "#fff";
-        ctx.strokeStyle = checked ? C.cbFill : C.cbBorder;
-        ctx.lineWidth   = 1;
-        ctx.beginPath(); ctx.roundRect(x, y, s, s, 2); ctx.fill(); ctx.stroke();
-        if (checked) {
-            ctx.strokeStyle = C.cbCheck; ctx.lineWidth = 2; ctx.lineCap = "round"; ctx.lineJoin = "round";
-            ctx.beginPath(); ctx.moveTo(x+3, y+7); ctx.lineTo(x+6, y+10); ctx.lineTo(x+11, y+4); ctx.stroke();
-        } else if (indeterminate) {
-            ctx.strokeStyle = C.cbFill; ctx.lineWidth = 2;
-            ctx.beginPath(); ctx.moveTo(x+3, y+7); ctx.lineTo(x+11, y+7); ctx.stroke();
-        }
-    }
-
-    private drawScrollbar(ctx: CanvasRenderingContext2D, W: number, H: number): void {
-        const bodyH = H - HEADER_H, totalH = this.filteredRows.length * ROW_H, tx = W - SB_W;
-        ctx.fillStyle = C.sbTrack; ctx.fillRect(tx, HEADER_H, SB_W, bodyH);
-        if (totalH <= bodyH) return;
-        const thumbH = Math.max(24, (bodyH / totalH) * bodyH);
-        const thumbY = HEADER_H + (this.scrollTop / this.maxScroll()) * (bodyH - thumbH);
-        ctx.fillStyle = C.sbThumb;
-        ctx.beginPath(); ctx.roundRect(tx + 2, thumbY + 1, SB_W - 4, thumbH - 2, 3); ctx.fill();
-    }
-
-    // ==========================================================
-    // Canvas イベント
-    // ==========================================================
-    private setupCanvasEvents(): void {
-        this.canvas.addEventListener("wheel", (e: WheelEvent) => {
-            e.preventDefault();
-            this.scrollTop = Math.max(0, Math.min(this.scrollTop + e.deltaY, this.maxScroll()));
-            this.scheduleRedraw();
-        }, { passive: false });
-
-        this.canvas.addEventListener("click", (e: MouseEvent) => {
-            const r = this.canvas.getBoundingClientRect();
-            const x = e.clientX - r.left, y = e.clientY - r.top;
-            if (x >= this.logicalW - SB_W) return;
-            if (y < HEADER_H) {
-                if (x < CB_W) this.toggleSelectAll();
-            } else if (x < CB_W) {
-                const ri = Math.floor((y - HEADER_H + this.scrollTop) / ROW_H);
-                if (ri >= 0 && ri < this.filteredRows.length) this.toggleRowSelection(ri);
-            }
-        });
-
-        this.canvas.addEventListener("mousemove", (e: MouseEvent) => {
-            const r = this.canvas.getBoundingClientRect();
-            const y = e.clientY - r.top;
-            const prev = this.hoveredRow;
-            this.hoveredRow = y < HEADER_H ? -1 : Math.floor((y - HEADER_H + this.scrollTop) / ROW_H);
-            if (this.hoveredRow !== prev) this.scheduleRedraw();
-            if (this.isDragging) {
-                const dy = y - this.dragStartY;
-                const ratio = (this.filteredRows.length * ROW_H) / (this.logicalH - HEADER_H);
-                this.scrollTop = Math.max(0, Math.min(this.dragStartScroll + dy * ratio, this.maxScroll()));
-                this.scheduleRedraw();
-            }
-        });
-
-        this.canvas.addEventListener("mousedown", (e: MouseEvent) => {
-            const r = this.canvas.getBoundingClientRect();
-            if (e.clientX - r.left >= this.logicalW - SB_W) {
-                this.isDragging = true; this.dragStartY = e.clientY - r.top; this.dragStartScroll = this.scrollTop;
-            }
-        });
-
-        const endDrag = () => { this.isDragging = false; };
-        this.canvas.addEventListener("mouseup",    endDrag);
-        this.canvas.addEventListener("mouseleave", () => { endDrag(); this.hoveredRow = -1; this.scheduleRedraw(); });
     }
 
     public getFormattingModel(): powerbi.visuals.FormattingModel {
