@@ -138,7 +138,12 @@ export class Visual implements IVisual {
         // 列数が変わったらタブをリセット
         const colsChanged = this.tableData.columns.length !== this.colCount;
         this.colCount = this.tableData.columns.length;
-        if (colsChanged) this.activeColTab = -1;
+        if (colsChanged) {
+            this.activeColTab = -1;
+            // 列構成変更時は selfFilterApplied もリセット（列違いで rebuildSelectionFromValues が誤動作するのを防ぐ）
+            this.selfFilterApplied = false;
+            this.selectedValues.clear();
+        }
 
         // 行数が変わったとき（外部スライサー等）：スクロールリセット＋選択クリア
         // ただし自分で applyJsonFilter した直後は選択状態を維持してインデックスを再マップ
@@ -206,6 +211,8 @@ export class Visual implements IVisual {
     // フィルターパネル
     // ==========================================================
     private renderFilterPanel(): void {
+        // 再描画前にデバウンスタイマーをキャンセル（削除後の古いクロージャが誤った条件を書き換えるのを防ぐ）
+        if (this.persistTimer !== null) { clearTimeout(this.persistTimer); this.persistTimer = null; }
         this.clear(this.filterPanel);
 
         const hdr = this.el("div", "filter-header");
@@ -511,30 +518,39 @@ export class Visual implements IVisual {
     // 選択値でデータセットフィルターを適用（スライサーの同期パネル対応）
     private applyDatasetFilter(): void {
         const dv = this.lastDataView;
-        if (!dv?.table?.columns?.length) return;
 
         // フィルターキー列：アクティブなタブ列、なければ先頭列
         const colIdx = this.activeColTab >= 0 ? this.activeColTab : 0;
-        const col    = dv.table.columns[colIdx];
-        if (!col?.queryName) return;
 
-        // 選択値を更新
+        // selectedValues は早期 return の前に必ず selectedOrigIdx から再構築する
+        // （early return 時に selectedValues が stale になると rebuildSelectionFromValues が誤動作する）
         this.selectedValues.clear();
-        this.selectedOrigIdx.forEach(i => {
-            const v = this.tableData.rows[i]?.[colIdx];
-            if (v != null && v !== "") this.selectedValues.add(v);
-        });
+        if (dv?.table?.columns?.length) {
+            this.selectedOrigIdx.forEach(i => {
+                const v = this.tableData.rows[i]?.[colIdx];
+                if (v != null && v !== "") this.selectedValues.add(v);
+            });
+        }
+
+        if (!dv?.table?.columns?.length) return;
+
+        const col = dv.table.columns[colIdx];
+
+        // queryName が "テーブル名.列名" 形式かバリデーション
+        const dotIdx = col?.queryName?.indexOf(".");
+        if (!col?.queryName || dotIdx === undefined || dotIdx < 1) {
+            // queryName が無効な場合はフィルター適用不可（selectedValues のみ更新して終了）
+            return;
+        }
 
         if (this.selectedValues.size === 0) {
             this.host.applyJsonFilter(null, "general", "filter", FilterAction.remove);
             return;
         }
 
-        // queryName は "テーブル名.列名" 形式
-        const parts  = col.queryName.split(".");
         const target: IFilterColumnTarget = {
-            table:  parts[0],
-            column: parts.slice(1).join(".") || col.displayName,
+            table:  col.queryName.substring(0, dotIdx),
+            column: col.queryName.substring(dotIdx + 1) || col.displayName,
         };
         const values = Array.from(this.selectedValues);
         const filter = new BasicFilter(target, "In", values);
