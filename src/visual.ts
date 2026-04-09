@@ -32,6 +32,9 @@ export class Visual implements IVisual {
     private conditions: FilterCondition[] = [];
     private logic: "AND" | "OR" = "AND";
     private tableData: TableData = { columns: [], rows: [] };
+    // 実行ボタンを押した時点の条件スナップショット
+    private appliedConditions: FilterCondition[] = [];
+    private appliedLogic: "AND" | "OR" = "AND";
 
     private filterPanel: HTMLElement;
     private tableContainer: HTMLElement;
@@ -69,24 +72,32 @@ export class Visual implements IVisual {
         const dataView: DataView = options.dataViews?.[0];
         this.tableData = this.extractTableData(dataView);
 
-        // 入力中（フォーカスあり）は条件を上書きしない → フォーカス・スクロール位置を維持
+        // 入力中はパネルを再構築しない（フォーカス維持）
         const isTyping = this.filterPanel.querySelector("input:focus") !== null;
         if (!isTyping) {
             const savedConditions = dataView?.metadata?.objects
                 ?.["filterState"]?.["conditions"] as string ?? "";
             const savedLogic = dataView?.metadata?.objects
                 ?.["filterState"]?.["logic"] as string ?? "AND";
+            const savedApplied = dataView?.metadata?.objects
+                ?.["filterState"]?.["applied"] as string ?? "";
+            const savedAppliedLogic = dataView?.metadata?.objects
+                ?.["filterState"]?.["appliedLogic"] as string ?? "AND";
 
-            if (savedConditions) {
-                try {
-                    this.conditions = JSON.parse(savedConditions);
-                } catch {
-                    this.conditions = [];
-                }
-            } else {
+            try {
+                this.conditions = savedConditions ? JSON.parse(savedConditions) : [];
+            } catch {
                 this.conditions = [];
             }
-            this.logic = (savedLogic === "OR") ? "OR" : "AND";
+            this.logic = savedLogic === "OR" ? "OR" : "AND";
+
+            try {
+                this.appliedConditions = savedApplied ? JSON.parse(savedApplied) : [];
+            } catch {
+                this.appliedConditions = [];
+            }
+            this.appliedLogic = savedAppliedLogic === "OR" ? "OR" : "AND";
+
             this.renderFilterPanel();
         }
 
@@ -98,10 +109,7 @@ export class Visual implements IVisual {
 
         const columns = dataView.table.columns.map(c => c.displayName || "");
         const rows = dataView.table.rows.map(row =>
-            row.map(cell => {
-                if (cell === null || cell === undefined) return "";
-                return String(cell);
-            })
+            row.map(cell => (cell === null || cell === undefined) ? "" : String(cell))
         );
         return { columns, rows };
     }
@@ -113,6 +121,7 @@ export class Visual implements IVisual {
     private renderFilterPanel(): void {
         this.clearElement(this.filterPanel);
 
+        // ヘッダー行（タイトル + AND/OR）
         const header = document.createElement("div");
         header.className = "filter-header";
 
@@ -127,33 +136,47 @@ export class Visual implements IVisual {
         const andBtn = document.createElement("button");
         andBtn.textContent = "AND";
         andBtn.className = "logic-btn" + (this.logic === "AND" ? " active" : "");
-        andBtn.onclick = () => this.setLogic("AND");
+        andBtn.onclick = () => { this.logic = "AND"; this.saveState(); this.renderFilterPanel(); };
 
         const orBtn = document.createElement("button");
         orBtn.textContent = "OR";
         orBtn.className = "logic-btn" + (this.logic === "OR" ? " active" : "");
-        orBtn.onclick = () => this.setLogic("OR");
+        orBtn.onclick = () => { this.logic = "OR"; this.saveState(); this.renderFilterPanel(); };
 
         logicToggle.appendChild(andBtn);
         logicToggle.appendChild(orBtn);
         header.appendChild(logicToggle);
         this.filterPanel.appendChild(header);
 
+        // 条件リスト
         const conditionList = document.createElement("div");
         conditionList.className = "condition-list";
-
         this.conditions.forEach((cond, idx) => {
-            const row = this.createConditionRow(cond, idx);
-            conditionList.appendChild(row);
+            conditionList.appendChild(this.createConditionRow(cond, idx));
         });
-
         this.filterPanel.appendChild(conditionList);
+
+        // フッター行（条件追加 + 実行ボタン）
+        const footer = document.createElement("div");
+        footer.className = "filter-footer";
 
         const addBtn = document.createElement("button");
         addBtn.className = "add-condition-btn";
         addBtn.textContent = "+ 条件を追加";
-        addBtn.onclick = () => this.addCondition();
-        this.filterPanel.appendChild(addBtn);
+        addBtn.onclick = () => {
+            this.conditions.push({ columnIndex: 0, operator: "contains", value: "" });
+            this.saveState();
+            this.renderFilterPanel();
+        };
+
+        const runBtn = document.createElement("button");
+        runBtn.className = "run-btn";
+        runBtn.textContent = "実行";
+        runBtn.onclick = () => this.executeSearch();
+
+        footer.appendChild(addBtn);
+        footer.appendChild(runBtn);
+        this.filterPanel.appendChild(footer);
     }
 
     private createConditionRow(cond: FilterCondition, idx: number): HTMLElement {
@@ -171,7 +194,7 @@ export class Visual implements IVisual {
         });
         colSelect.onchange = () => {
             this.conditions[idx].columnIndex = parseInt(colSelect.value, 10);
-            this.saveAndRender();
+            this.saveState();
         };
 
         const opSelect = document.createElement("select");
@@ -188,7 +211,7 @@ export class Visual implements IVisual {
         });
         opSelect.onchange = () => {
             this.conditions[idx].operator = opSelect.value as "contains" | "notContains";
-            this.saveAndRender();
+            this.saveState();
         };
 
         const valueInput = document.createElement("input");
@@ -196,7 +219,15 @@ export class Visual implements IVisual {
         valueInput.className = "value-input";
         valueInput.placeholder = "検索キーワード";
         valueInput.value = cond.value;
-        valueInput.oninput = () => this.onTextInput(idx, valueInput.value);
+        // 入力中は条件をメモリ更新＋デバウンス保存のみ。テーブルは触らない
+        valueInput.oninput = () => {
+            this.conditions[idx].value = valueInput.value;
+            this.debounceSave();
+        };
+        // Enter キーで実行
+        valueInput.onkeydown = (e: KeyboardEvent) => {
+            if (e.key === "Enter") this.executeSearch();
+        };
 
         const removeBtn = document.createElement("button");
         removeBtn.className = "remove-btn";
@@ -204,7 +235,8 @@ export class Visual implements IVisual {
         removeBtn.title = "条件を削除";
         removeBtn.onclick = () => {
             this.conditions.splice(idx, 1);
-            this.saveAndRender();
+            this.saveState();
+            this.renderFilterPanel();
         };
 
         row.appendChild(colSelect);
@@ -214,18 +246,26 @@ export class Visual implements IVisual {
         return row;
     }
 
-    private addCondition(): void {
-        this.conditions.push({
-            columnIndex: 0,
-            operator: "contains",
-            value: "",
-        });
-        this.saveAndRender();
+    // 実行ボタン or Enter → 現在の conditions を applied にコピーしてテーブル更新
+    private executeSearch(): void {
+        this.appliedConditions = this.conditions.map(c => ({ ...c }));
+        this.appliedLogic = this.logic;
+        this.persist();
+        this.renderTable();
     }
 
-    private setLogic(logic: "AND" | "OR"): void {
-        this.logic = logic;
-        this.saveAndRender();
+    // 条件の構造変更（追加・削除・列・演算子・AND/OR）を即座に保存
+    private saveState(): void {
+        this.persist();
+    }
+
+    // テキスト入力は 800ms デバウンスで保存
+    private debounceSave(): void {
+        if (this.persistTimer !== null) clearTimeout(this.persistTimer);
+        this.persistTimer = window.setTimeout(() => {
+            this.persistTimer = null;
+            this.persist();
+        }, 800);
     }
 
     private persist(): void {
@@ -236,49 +276,24 @@ export class Visual implements IVisual {
                 properties: {
                     conditions: JSON.stringify(this.conditions),
                     logic: this.logic,
+                    applied: JSON.stringify(this.appliedConditions),
+                    appliedLogic: this.appliedLogic,
                 },
             }],
         });
     }
 
-    // 列変更・演算子変更・条件追加削除・AND/OR切り替えはすぐ保存＋全体再描画
-    private saveAndRender(): void {
-        this.persist();
-        this.renderFilterPanel();
-        this.renderTable();
-    }
-
-    // テキスト入力はテーブルだけ即時更新、保存は 800ms デバウンス
-    private onTextInput(idx: number, value: string): void {
-        this.conditions[idx].value = value;
-        this.renderTable();
-        if (this.persistTimer !== null) clearTimeout(this.persistTimer);
-        this.persistTimer = window.setTimeout(() => {
-            this.persistTimer = null;
-            this.persist();
-        }, 800);
-    }
-
     private applyFilters(rows: string[][]): string[][] {
-        const activeConditions = this.conditions.filter(c => c.value.trim() !== "");
-        if (activeConditions.length === 0) return rows;
+        const active = this.appliedConditions.filter(c => c.value.trim() !== "");
+        if (active.length === 0) return rows;
 
         return rows.filter(row => {
-            const results = activeConditions.map(cond => {
-                const cellValue = (row[cond.columnIndex] ?? "").toLowerCase();
-                const keyword = cond.value.toLowerCase();
-                if (cond.operator === "contains") {
-                    return cellValue.includes(keyword);
-                } else {
-                    return !cellValue.includes(keyword);
-                }
+            const results = active.map(cond => {
+                const cell = (row[cond.columnIndex] ?? "").toLowerCase();
+                const kw = cond.value.toLowerCase();
+                return cond.operator === "contains" ? cell.includes(kw) : !cell.includes(kw);
             });
-
-            if (this.logic === "AND") {
-                return results.every(Boolean);
-            } else {
-                return results.some(Boolean);
-            }
+            return this.appliedLogic === "AND" ? results.every(Boolean) : results.some(Boolean);
         });
     }
 
@@ -295,9 +310,7 @@ export class Visual implements IVisual {
         }
 
         const filteredRows = this.applyFilters(this.tableData.rows);
-
-        this.statusBar.textContent =
-            `${filteredRows.length} / ${this.tableData.rows.length} 件`;
+        this.statusBar.textContent = `${filteredRows.length} / ${this.tableData.rows.length} 件`;
 
         const table = document.createElement("table");
         table.className = "data-table";

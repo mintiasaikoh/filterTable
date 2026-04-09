@@ -124,8 +124,15 @@
             }
         }
 
-        .add-condition-btn {
+        .filter-footer {
+            display: flex;
+            align-items: center;
+            gap: 6px;
             margin-top: 6px;
+        }
+
+        .add-condition-btn {
+            flex: 1;
             padding: 4px 10px;
             border: 1px dashed #0078d4;
             border-radius: 3px;
@@ -133,12 +140,32 @@
             color: #0078d4;
             cursor: pointer;
             font-size: 12px;
-            width: 100%;
             text-align: left;
             transition: background 0.15s;
 
             &:hover {
                 background: #e8f4fd;
+            }
+        }
+
+        .run-btn {
+            flex: 0 0 auto;
+            padding: 4px 16px;
+            border: none;
+            border-radius: 3px;
+            background: #0078d4;
+            color: #fff;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 600;
+            transition: background 0.15s;
+
+            &:hover {
+                background: #106ebe;
+            }
+
+            &:active {
+                background: #005a9e;
             }
         }
     }

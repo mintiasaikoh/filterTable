@@ -16,6 +16,14 @@
                 "logic": {
                     "displayName": "論理演算子",
                     "type": { "text": true }
+                },
+                "applied": {
+                    "displayName": "適用済み条件",
+                    "type": { "text": true }
+                },
+                "appliedLogic": {
+                    "displayName": "適用済み論理演算子",
+                    "type": { "text": true }
                 }
             }
         }
