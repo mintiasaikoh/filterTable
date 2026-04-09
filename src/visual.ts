@@ -65,6 +65,7 @@ export class Visual implements IVisual {
     private skipRender        = false;
     private hasInteracted     = false;
     private selfFilterApplied = false; // applyJsonFilter 後の update で選択クリアを防ぐ
+    private hasAppliedFilter  = false; // applyJsonFilter(remove) の無駄撃ちを防ぐ
     private prevRowCount      = -1;    // データ変化検知用
     private persistTimer: number | null = null;
     private scrollRaf:    number | null = null;
@@ -133,34 +134,32 @@ export class Visual implements IVisual {
 
         this.lastDataView = dv;
         this.tableData = this.extractTableData(dv);
-        this.buildSelectionIds(dv);
 
         // 列数が変わったらタブをリセット
         const colsChanged = this.tableData.columns.length !== this.colCount;
         this.colCount = this.tableData.columns.length;
         if (colsChanged) {
             this.activeColTab = -1;
-            // 列構成変更時は selfFilterApplied もリセット（列違いで rebuildSelectionFromValues が誤動作するのを防ぐ）
             this.selfFilterApplied = false;
             this.selectedValues.clear();
         }
 
-        // 行数が変わったとき（外部スライサー等）：スクロールリセット＋選択クリア
-        // ただし自分で applyJsonFilter した直後は選択状態を維持してインデックスを再マップ
+        // 行数が変わったとき：selectionIds 再生成＋スクロールリセット＋選択クリア
         const rowCount = this.tableData.rows.length;
         const rowsChanged = rowCount !== this.prevRowCount;
         this.prevRowCount = rowCount;
         if (rowsChanged) {
+            this.buildSelectionIds(dv); // 行数変化時のみ O(n) 再生成
             this.scrollEl.scrollTop = 0;
             if (this.selfFilterApplied) {
-                // 自分で applyJsonFilter した直後：selectedValues を元にインデックスを再マップ
                 this.rebuildSelectionFromValues();
             } else {
-                // 外部スライサー等によるデータ変化：選択状態をクリア
                 this.selectedOrigIdx.clear();
                 this.selectedValues.clear();
             }
-            this.selfFilterApplied = false; // rowsChanged 時にだけリセット（早期リセット防止）
+            this.selfFilterApplied = false;
+        } else if (this.selectionIds.length === 0) {
+            this.buildSelectionIds(dv); // 初回のみ
         }
 
         if (!this.filterPanel.querySelector(".value-input:focus")) {
@@ -335,11 +334,12 @@ export class Visual implements IVisual {
     private executeSearch(): void {
         this.appliedConditions = this.conditions.map(c => ({ ...c }));
         this.appliedLogic = this.logic;
-        // テキストフィルター変更時は選択状態をリセット（データセットフィルターとの矛盾防止）
         this.selectedOrigIdx.clear();
         this.selectedValues.clear();
-        this.selectionManager.clear();
-        this.host.applyJsonFilter(null, "general", "filter", FilterAction.remove);
+        if (this.hasAppliedFilter) {
+            this.host.applyJsonFilter(null, "general", "filter", FilterAction.remove);
+            this.hasAppliedFilter = false;
+        }
         this.runFilter();
         this.renderTableHeader();
         this.scrollEl.scrollTop = 0;
@@ -349,11 +349,12 @@ export class Visual implements IVisual {
 
     private clearFilter(): void {
         this.appliedConditions = []; this.appliedLogic = "AND";
-        // フィルター解除時も選択をリセット
         this.selectedOrigIdx.clear();
         this.selectedValues.clear();
-        this.selectionManager.clear();
-        this.host.applyJsonFilter(null, "general", "filter", FilterAction.remove);
+        if (this.hasAppliedFilter) {
+            this.host.applyJsonFilter(null, "general", "filter", FilterAction.remove);
+            this.hasAppliedFilter = false;
+        }
         this.runFilter();
         this.renderTableHeader();
         this.scrollEl.scrollTop = 0;
@@ -504,13 +505,9 @@ export class Visual implements IVisual {
     }
 
     private commitSelection(): void {
-        // 同ページクロスフィルター（ハイライト）
-        const ids = Array.from(this.selectedOrigIdx).map(i => this.selectionIds[i]).filter(Boolean);
-        ids.length ? this.selectionManager.select(ids) : this.selectionManager.clear();
-
-        // データセットレベルフィルター（スライサー同期に必要）
+        // applyJsonFilter でデータセットレベルフィルター（スライサー同期 + 同ページクロスフィルター）
+        // selectionManager は使わない（呼ぶと update() が余分にトリガーされ 2倍重くなる）
         this.applyDatasetFilter();
-
         this.updateSelectionUI();
         this.renderStatus();
     }
@@ -544,7 +541,10 @@ export class Visual implements IVisual {
         }
 
         if (this.selectedValues.size === 0) {
-            this.host.applyJsonFilter(null, "general", "filter", FilterAction.remove);
+            if (this.hasAppliedFilter) {
+                this.host.applyJsonFilter(null, "general", "filter", FilterAction.remove);
+                this.hasAppliedFilter = false;
+            }
             return;
         }
 
@@ -556,6 +556,7 @@ export class Visual implements IVisual {
         const filter = new BasicFilter(target, "In", values);
 
         this.selfFilterApplied = true;
+        this.hasAppliedFilter  = true;
         this.host.applyJsonFilter(filter.toJSON(), "general", "filter", FilterAction.merge);
     }
 
