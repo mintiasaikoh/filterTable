@@ -2,6 +2,7 @@
 
 import powerbi from "powerbi-visuals-api";
 import { FormattingSettingsService } from "powerbi-visuals-utils-formattingmodel";
+import { BasicFilter, IFilterColumnTarget, FilterType } from "powerbi-models";
 import "./../style/visual.less";
 
 import VisualConstructorOptions = powerbi.extensibility.visual.VisualConstructorOptions;
@@ -10,6 +11,7 @@ import IVisual                  = powerbi.extensibility.visual.IVisual;
 import IVisualHost              = powerbi.extensibility.visual.IVisualHost;
 import ISelectionManager        = powerbi.extensibility.ISelectionManager;
 import DataView                 = powerbi.DataView;
+import FilterAction             = powerbi.FilterAction;
 
 import { VisualFormattingSettingsModel } from "./settings";
 
@@ -43,8 +45,10 @@ export class Visual implements IVisual {
     private filteredOrigIdx: number[]            = [];
     private selectionIds: powerbi.visuals.ISelectionId[] = [];
     private selectedOrigIdx: Set<number>         = new Set();
+    private selectedValues: Set<string>          = new Set(); // フィルター同期用の選択値
     private activeColTab  = -1;   // -1=全列表示, 0..n-1=指定列のみ表示
     private colCount      = 0;    // 列数変化検知用
+    private lastDataView: DataView | null        = null;      // フィルター生成用
 
     // ---- DOM ----
     private filterPanel:  HTMLElement;
@@ -58,9 +62,10 @@ export class Visual implements IVisual {
     private tbody:        HTMLTableSectionElement;
 
     // ---- 制御フラグ ----
-    private skipRender     = false;
-    private hasInteracted  = false;
-    private prevRowCount   = -1;   // データ変化検知用
+    private skipRender        = false;
+    private hasInteracted     = false;
+    private selfFilterApplied = false; // applyJsonFilter 後の update で選択クリアを防ぐ
+    private prevRowCount      = -1;    // データ変化検知用
     private persistTimer: number | null = null;
     private scrollRaf:    number | null = null;
 
@@ -126,6 +131,7 @@ export class Visual implements IVisual {
             return;
         }
 
+        this.lastDataView = dv;
         this.tableData = this.extractTableData(dv);
         this.buildSelectionIds(dv);
 
@@ -135,14 +141,21 @@ export class Visual implements IVisual {
         if (colsChanged) this.activeColTab = -1;
 
         // 行数が変わったとき（外部スライサー等）：スクロールリセット＋選択クリア
+        // ただし自分で applyJsonFilter した直後は選択状態を維持してインデックスを再マップ
         const rowCount = this.tableData.rows.length;
         const rowsChanged = rowCount !== this.prevRowCount;
         this.prevRowCount = rowCount;
         if (rowsChanged) {
             this.scrollEl.scrollTop = 0;
-            // 行インデックスが無効になるため選択状態をクリア
-            this.selectedOrigIdx.clear();
+            if (this.selfFilterApplied) {
+                // フィルター後の新データで selectedValues を元に selectedOrigIdx を再構築
+                this.rebuildSelectionFromValues();
+            } else {
+                this.selectedOrigIdx.clear();
+                this.selectedValues.clear();
+            }
         }
+        this.selfFilterApplied = false;
 
         if (!this.filterPanel.querySelector(".value-input:focus")) {
             // ユーザーが操作済みかつ列構成が変わっていない場合は状態を上書きしない
@@ -465,13 +478,67 @@ export class Visual implements IVisual {
         this.commitSelection();
     }
 
-    private clearSelection(): void { this.selectedOrigIdx.clear(); this.commitSelection(); }
+    private clearSelection(): void {
+        this.selectedOrigIdx.clear();
+        this.selectedValues.clear();
+        this.commitSelection();
+    }
 
     private commitSelection(): void {
+        // 同ページクロスフィルター（ハイライト）
         const ids = Array.from(this.selectedOrigIdx).map(i => this.selectionIds[i]).filter(Boolean);
         ids.length ? this.selectionManager.select(ids) : this.selectionManager.clear();
+
+        // データセットレベルフィルター（スライサー同期に必要）
+        this.applyDatasetFilter();
+
         this.updateSelectionUI();
         this.renderStatus();
+    }
+
+    // 選択値でデータセットフィルターを適用（スライサーの同期パネル対応）
+    private applyDatasetFilter(): void {
+        const dv = this.lastDataView;
+        if (!dv?.table?.columns?.length) return;
+
+        // フィルターキー列：アクティブなタブ列、なければ先頭列
+        const colIdx = this.activeColTab >= 0 ? this.activeColTab : 0;
+        const col    = dv.table.columns[colIdx];
+        if (!col?.queryName) return;
+
+        // 選択値を更新
+        this.selectedValues.clear();
+        this.selectedOrigIdx.forEach(i => {
+            const v = this.tableData.rows[i]?.[colIdx];
+            if (v != null && v !== "") this.selectedValues.add(v);
+        });
+
+        if (this.selectedValues.size === 0) {
+            this.host.applyJsonFilter(null, "general", "filter", FilterAction.remove);
+            return;
+        }
+
+        // queryName は "テーブル名.列名" 形式
+        const parts  = col.queryName.split(".");
+        const target: IFilterColumnTarget = {
+            table:  parts[0],
+            column: parts.slice(1).join(".") || col.displayName,
+        };
+        const values = Array.from(this.selectedValues);
+        const filter = new BasicFilter(target, "In", values);
+
+        this.selfFilterApplied = true;
+        this.host.applyJsonFilter(filter.toJSON(), "general", "filter", FilterAction.merge);
+    }
+
+    // フィルター後に新しいデータで選択インデックスを再マップ
+    private rebuildSelectionFromValues(): void {
+        if (this.selectedValues.size === 0) { this.selectedOrigIdx.clear(); return; }
+        const colIdx = this.activeColTab >= 0 ? this.activeColTab : 0;
+        this.selectedOrigIdx.clear();
+        this.tableData.rows.forEach((row, i) => {
+            if (this.selectedValues.has(row[colIdx] ?? "")) this.selectedOrigIdx.add(i);
+        });
     }
 
     // 選択変更時：全行再生成せず、可視行のチェックボックスだけ更新
