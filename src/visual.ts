@@ -60,6 +60,7 @@ export class Visual implements IVisual {
     // ---- 制御フラグ ----
     private skipRender     = false;
     private hasInteracted  = false;
+    private prevRowCount   = -1;   // データ変化検知用
     private persistTimer: number | null = null;
     private scrollRaf:    number | null = null;
 
@@ -133,6 +134,16 @@ export class Visual implements IVisual {
         this.colCount = this.tableData.columns.length;
         if (colsChanged) this.activeColTab = -1;
 
+        // 行数が変わったとき（外部スライサー等）：スクロールリセット＋選択クリア
+        const rowCount = this.tableData.rows.length;
+        const rowsChanged = rowCount !== this.prevRowCount;
+        this.prevRowCount = rowCount;
+        if (rowsChanged) {
+            this.scrollEl.scrollTop = 0;
+            // 行インデックスが無効になるため選択状態をクリア
+            this.selectedOrigIdx.clear();
+        }
+
         if (!this.filterPanel.querySelector(".value-input:focus")) {
             // ユーザーが操作済みかつ列構成が変わっていない場合は状態を上書きしない
             if (!this.hasInteracted || colsChanged) this.restoreState(dv);
@@ -142,7 +153,6 @@ export class Visual implements IVisual {
         this.renderColToggleBar();
         this.runFilter();
         this.renderTableHeader();
-        this.scrollEl.scrollTop = 0;
         this.renderVirtualRows();
         this.renderStatus();
     }

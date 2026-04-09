@@ -38,5 +38,6 @@
             }
         }
     ],
+    "supportsHighlight": true,
     "privileges": []
 }
