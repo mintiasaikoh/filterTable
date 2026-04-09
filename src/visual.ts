@@ -43,7 +43,8 @@ export class Visual implements IVisual {
     private filteredOrigIdx: number[]            = [];
     private selectionIds: powerbi.visuals.ISelectionId[] = [];
     private selectedOrigIdx: Set<number>         = new Set();
-    private visibleCols: boolean[]               = [];
+    private activeColTab  = -1;   // -1=全列表示, 0..n-1=指定列のみ表示
+    private colCount      = 0;    // 列数変化検知用
 
     // ---- DOM ----
     private filterPanel:  HTMLElement;
@@ -57,7 +58,8 @@ export class Visual implements IVisual {
     private tbody:        HTMLTableSectionElement;
 
     // ---- 制御フラグ ----
-    private skipRender   = false;
+    private skipRender     = false;
+    private hasInteracted  = false;
     private persistTimer: number | null = null;
     private scrollRaf:    number | null = null;
 
@@ -126,15 +128,14 @@ export class Visual implements IVisual {
         this.tableData = this.extractTableData(dv);
         this.buildSelectionIds(dv);
 
-        // 列が増えた分は true で追加、既存の表示設定を保持
-        if (this.visibleCols.length !== this.tableData.columns.length) {
-            this.visibleCols = this.tableData.columns.map((_, i) =>
-                this.visibleCols[i] !== undefined ? this.visibleCols[i] : true
-            );
-        }
+        // 列数が変わったらタブをリセット
+        const colsChanged = this.tableData.columns.length !== this.colCount;
+        this.colCount = this.tableData.columns.length;
+        if (colsChanged) this.activeColTab = -1;
 
         if (!this.filterPanel.querySelector(".value-input:focus")) {
-            this.restoreState(dv);
+            // ユーザーが操作済みかつ列構成が変わっていない場合は状態を上書きしない
+            if (!this.hasInteracted || colsChanged) this.restoreState(dv);
             this.renderFilterPanel();
         }
 
@@ -260,7 +261,7 @@ export class Visual implements IVisual {
     }
 
     // ==========================================================
-    // 列トグルバー
+    // 列トグルバー（タブ動作：排他選択）
     // ==========================================================
     private renderColToggleBar(): void {
         this.clear(this.colToggleBar);
@@ -268,20 +269,33 @@ export class Visual implements IVisual {
         this.colToggleBar.style.display = multi ? "flex" : "none";
         if (!multi) return;
 
+        // 「全列」チップ
+        const allChip = this.el("button", "col-chip" + (this.activeColTab === -1 ? " active" : ""));
+        allChip.textContent = "全列";
+        allChip.onclick = () => {
+            this.activeColTab = -1;
+            this.renderColToggleBar();
+            this.renderTableHeader();
+            this.renderVirtualRows();
+        };
+        this.colToggleBar.appendChild(allChip);
+
+        // 各列チップ（クリックでその列だけ表示）
         this.tableData.columns.forEach((col, i) => {
-            const chip = this.el("button", "col-chip" + (this.visibleCols[i] ? " active" : ""));
+            const chip = this.el("button", "col-chip" + (this.activeColTab === i ? " active" : ""));
             chip.textContent = col;
-            chip.title = this.visibleCols[i] ? "非表示にする" : "表示する";
             chip.onclick = () => {
-                if (this.visibleCols.filter(Boolean).length === 1 && this.visibleCols[i]) return;
-                this.visibleCols[i] = !this.visibleCols[i];
-                chip.className = "col-chip" + (this.visibleCols[i] ? " active" : "");
-                chip.title = this.visibleCols[i] ? "非表示にする" : "表示する";
+                this.activeColTab = i;
+                this.renderColToggleBar();
                 this.renderTableHeader();
                 this.renderVirtualRows();
             };
             this.colToggleBar.appendChild(chip);
         });
+    }
+
+    private isColVisible(i: number): boolean {
+        return this.activeColTab === -1 || this.activeColTab === i;
     }
 
     // ==========================================================
@@ -334,7 +348,7 @@ export class Visual implements IVisual {
         const cbCol = this.el("col", ""); cbCol.style.width = "32px";
         this.colGroup.appendChild(cbCol);
         this.tableData.columns.forEach((_, i) => {
-            if (this.visibleCols[i]) this.colGroup.appendChild(this.el("col", ""));
+            if (this.isColVisible(i)) this.colGroup.appendChild(this.el("col", ""));
         });
 
         // thead 行
@@ -351,7 +365,7 @@ export class Visual implements IVisual {
         tr.appendChild(cbTh);
 
         this.tableData.columns.forEach((col, i) => {
-            if (!this.visibleCols[i]) return;
+            if (!this.isColVisible(i)) return;
             const th = this.el("th", ""); th.textContent = col;
             tr.appendChild(th);
         });
@@ -366,7 +380,7 @@ export class Visual implements IVisual {
         if (total === 0) {
             this.clear(this.tbody);
             const tr = this.el("tr", ""); const td = this.el("td", "no-data") as HTMLTableCellElement;
-            const visCols = this.tableData.columns.filter((_, i) => this.visibleCols[i]).length;
+            const visCols = this.tableData.columns.filter((_, i) => this.isColVisible(i)).length;
             td.colSpan = visCols + 1;
             td.textContent = this.tableData.columns.length === 0
                 ? "データをフィールドに追加してください"
@@ -379,7 +393,7 @@ export class Visual implements IVisual {
         const endRow   = Math.min(total, startRow + Math.ceil(viewH / ROW_H) + BUFFER * 2);
         const beforeH  = startRow * ROW_H;
         const afterH   = Math.max(0, (total - endRow) * ROW_H);
-        const span     = this.tableData.columns.filter((_, i) => this.visibleCols[i]).length + 1;
+        const span     = this.tableData.columns.filter((_, i) => this.isColVisible(i)).length + 1;
 
         this.clear(this.tbody);
         const frag = document.createDocumentFragment();
@@ -415,7 +429,7 @@ export class Visual implements IVisual {
 
         const row = this.filteredRows[ri];
         this.tableData.columns.forEach((_, i) => {
-            if (!this.visibleCols[i]) return;
+            if (!this.isColVisible(i)) return;
             const td = this.el("td", "") as HTMLTableCellElement;
             td.textContent = row[i] ?? "";
             tr.appendChild(td);
@@ -499,6 +513,7 @@ export class Visual implements IVisual {
 
     private persist(): void {
         this.skipRender = true;
+        this.hasInteracted = true;
         this.host.persistProperties({ merge: [{ objectName: "filterState", selector: null, properties: {
             conditions: JSON.stringify(this.conditions), logic: this.logic,
             applied: JSON.stringify(this.appliedConditions), appliedLogic: this.appliedLogic,
