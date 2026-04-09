@@ -33,7 +33,7 @@
             "table": {
                 "rows": {
                     "for": { "in": "values" },
-                    "dataReductionAlgorithm": { "top": { "count": 10000 } }
+                    "dataReductionAlgorithm": { "top": { "count": 100000 } }
                 }
             }
         }

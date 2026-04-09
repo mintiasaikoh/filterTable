@@ -9,7 +9,6 @@ import VisualConstructorOptions = powerbi.extensibility.visual.VisualConstructor
 import VisualUpdateOptions      = powerbi.extensibility.visual.VisualUpdateOptions;
 import IVisual                  = powerbi.extensibility.visual.IVisual;
 import IVisualHost              = powerbi.extensibility.visual.IVisualHost;
-import ISelectionManager        = powerbi.extensibility.ISelectionManager;
 import DataView                 = powerbi.DataView;
 import FilterAction             = powerbi.FilterAction;
 
@@ -33,7 +32,6 @@ export class Visual implements IVisual {
     private host: IVisualHost;
     private formattingSettings: VisualFormattingSettingsModel;
     private formattingSettingsService: FormattingSettingsService;
-    private selectionManager: ISelectionManager;
 
     // ---- データ状態 ----
     private conditions: FilterCondition[]        = [];
@@ -43,7 +41,6 @@ export class Visual implements IVisual {
     private appliedLogic: "AND" | "OR"           = "AND";
     private filteredRows: string[][]             = [];
     private filteredOrigIdx: number[]            = [];
-    private selectionIds: powerbi.visuals.ISelectionId[] = [];
     private selectedOrigIdx: Set<number>         = new Set();
     private selectedValues: Set<string>          = new Set(); // フィルター同期用の選択値
     private activeColTab  = -1;   // -1=全列表示, 0..n-1=指定列のみ表示
@@ -73,7 +70,6 @@ export class Visual implements IVisual {
     constructor(options: VisualConstructorOptions) {
         this.host = options.host;
         this.formattingSettingsService = new FormattingSettingsService();
-        this.selectionManager = options.host.createSelectionManager();
         options.element.className = "filter-table-visual";
         this.buildDOM(options.element);
     }
@@ -144,12 +140,11 @@ export class Visual implements IVisual {
             this.selectedValues.clear();
         }
 
-        // 行数が変わったとき：selectionIds 再生成＋スクロールリセット＋選択クリア
+        // 行数が変わったとき：スクロールリセット＋選択クリア
         const rowCount = this.tableData.rows.length;
         const rowsChanged = rowCount !== this.prevRowCount;
         this.prevRowCount = rowCount;
         if (rowsChanged) {
-            this.buildSelectionIds(dv); // 行数変化時のみ O(n) 再生成
             this.scrollEl.scrollTop = 0;
             if (this.selfFilterApplied) {
                 this.rebuildSelectionFromValues();
@@ -158,8 +153,6 @@ export class Visual implements IVisual {
                 this.selectedValues.clear();
             }
             this.selfFilterApplied = false;
-        } else if (this.selectionIds.length === 0) {
-            this.buildSelectionIds(dv); // 初回のみ
         }
 
         if (!this.filterPanel.querySelector(".value-input:focus")) {
@@ -194,16 +187,6 @@ export class Visual implements IVisual {
             columns: dv.table.columns.map(c => c.displayName || ""),
             rows:    dv.table.rows.map(r => r.map(c => (c == null) ? "" : String(c))),
         };
-    }
-
-    private buildSelectionIds(dv: DataView): void {
-        this.selectionIds = [];
-        if (!dv?.table) return;
-        for (let i = 0; i < dv.table.rows.length; i++) {
-            this.selectionIds.push(
-                this.host.createSelectionIdBuilder().withTable(dv.table, i).createSelectionId()
-            );
-        }
     }
 
     // ==========================================================
