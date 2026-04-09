@@ -37,6 +37,8 @@ export class Visual implements IVisual {
     private tableContainer: HTMLElement;
     private statusBar: HTMLElement;
 
+    private persistTimer: number | null = null;
+
     constructor(options: VisualConstructorOptions) {
         this.host = options.host;
         this.formattingSettingsService = new FormattingSettingsService();
@@ -67,23 +69,27 @@ export class Visual implements IVisual {
         const dataView: DataView = options.dataViews?.[0];
         this.tableData = this.extractTableData(dataView);
 
-        const savedConditions = dataView?.metadata?.objects
-            ?.["filterState"]?.["conditions"] as string ?? "";
-        const savedLogic = dataView?.metadata?.objects
-            ?.["filterState"]?.["logic"] as string ?? "AND";
+        // 入力中（フォーカスあり）は条件を上書きしない → フォーカス・スクロール位置を維持
+        const isTyping = this.filterPanel.querySelector("input:focus") !== null;
+        if (!isTyping) {
+            const savedConditions = dataView?.metadata?.objects
+                ?.["filterState"]?.["conditions"] as string ?? "";
+            const savedLogic = dataView?.metadata?.objects
+                ?.["filterState"]?.["logic"] as string ?? "AND";
 
-        if (savedConditions) {
-            try {
-                this.conditions = JSON.parse(savedConditions);
-            } catch {
+            if (savedConditions) {
+                try {
+                    this.conditions = JSON.parse(savedConditions);
+                } catch {
+                    this.conditions = [];
+                }
+            } else {
                 this.conditions = [];
             }
-        } else {
-            this.conditions = [];
+            this.logic = (savedLogic === "OR") ? "OR" : "AND";
+            this.renderFilterPanel();
         }
-        this.logic = (savedLogic === "OR") ? "OR" : "AND";
 
-        this.renderFilterPanel();
         this.renderTable();
     }
 
@@ -190,10 +196,7 @@ export class Visual implements IVisual {
         valueInput.className = "value-input";
         valueInput.placeholder = "検索キーワード";
         valueInput.value = cond.value;
-        valueInput.oninput = () => {
-            this.conditions[idx].value = valueInput.value;
-            this.saveAndRender();
-        };
+        valueInput.oninput = () => this.onTextInput(idx, valueInput.value);
 
         const removeBtn = document.createElement("button");
         removeBtn.className = "remove-btn";
@@ -225,21 +228,35 @@ export class Visual implements IVisual {
         this.saveAndRender();
     }
 
-    private saveAndRender(): void {
+    private persist(): void {
         this.host.persistProperties({
-            merge: [
-                {
-                    objectName: "filterState",
-                    selector: null,
-                    properties: {
-                        conditions: JSON.stringify(this.conditions),
-                        logic: this.logic,
-                    },
+            merge: [{
+                objectName: "filterState",
+                selector: null,
+                properties: {
+                    conditions: JSON.stringify(this.conditions),
+                    logic: this.logic,
                 },
-            ],
+            }],
         });
+    }
+
+    // 列変更・演算子変更・条件追加削除・AND/OR切り替えはすぐ保存＋全体再描画
+    private saveAndRender(): void {
+        this.persist();
         this.renderFilterPanel();
         this.renderTable();
+    }
+
+    // テキスト入力はテーブルだけ即時更新、保存は 800ms デバウンス
+    private onTextInput(idx: number, value: string): void {
+        this.conditions[idx].value = value;
+        this.renderTable();
+        if (this.persistTimer !== null) clearTimeout(this.persistTimer);
+        this.persistTimer = window.setTimeout(() => {
+            this.persistTimer = null;
+            this.persist();
+        }, 800);
     }
 
     private applyFilters(rows: string[][]): string[][] {
