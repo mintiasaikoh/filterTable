@@ -12,6 +12,8 @@ import DataView = powerbi.DataView;
 
 import { VisualFormattingSettingsModel } from "./settings";
 
+const PAGE_SIZE = 100;
+
 interface FilterCondition {
     columnIndex: number;
     operator: "contains" | "notContains";
@@ -32,14 +34,18 @@ export class Visual implements IVisual {
     private conditions: FilterCondition[] = [];
     private logic: "AND" | "OR" = "AND";
     private tableData: TableData = { columns: [], rows: [] };
-    // 実行ボタンを押した時点の条件スナップショット
     private appliedConditions: FilterCondition[] = [];
     private appliedLogic: "AND" | "OR" = "AND";
+    private filteredRows: string[][] = [];
+    private currentPage = 0;
 
     private filterPanel: HTMLElement;
     private tableContainer: HTMLElement;
     private statusBar: HTMLElement;
+    private pager: HTMLElement;
 
+    // 自分の persist 呼び出しによる update サイクルでテーブルを再描画しないフラグ
+    private skipTableRender = false;
     private persistTimer: number | null = null;
 
     constructor(options: VisualConstructorOptions) {
@@ -54,15 +60,19 @@ export class Visual implements IVisual {
         this.filterPanel = document.createElement("div");
         this.filterPanel.className = "filter-panel";
 
+        this.statusBar = document.createElement("div");
+        this.statusBar.className = "status-bar";
+
         this.tableContainer = document.createElement("div");
         this.tableContainer.className = "table-container";
 
-        this.statusBar = document.createElement("div");
-        this.statusBar.className = "status-bar";
+        this.pager = document.createElement("div");
+        this.pager.className = "pager";
 
         this.target.appendChild(this.filterPanel);
         this.target.appendChild(this.statusBar);
         this.target.appendChild(this.tableContainer);
+        this.target.appendChild(this.pager);
     }
 
     public update(options: VisualUpdateOptions): void {
@@ -70,46 +80,45 @@ export class Visual implements IVisual {
             .populateFormattingSettingsModel(VisualFormattingSettingsModel, options.dataViews?.[0]);
 
         const dataView: DataView = options.dataViews?.[0];
+
+        // 自分の persist による update は無視（テーブル再描画なし）
+        if (this.skipTableRender) {
+            this.skipTableRender = false;
+            // パネルだけ再描画（データは変わっていないので tableData は更新不要）
+            const isTyping = this.filterPanel.querySelector("input:focus") !== null;
+            if (!isTyping) this.renderFilterPanel();
+            return;
+        }
+
         this.tableData = this.extractTableData(dataView);
 
-        // 入力中はパネルを再構築しない（フォーカス維持）
         const isTyping = this.filterPanel.querySelector("input:focus") !== null;
         if (!isTyping) {
-            const savedConditions = dataView?.metadata?.objects
-                ?.["filterState"]?.["conditions"] as string ?? "";
-            const savedLogic = dataView?.metadata?.objects
-                ?.["filterState"]?.["logic"] as string ?? "AND";
-            const savedApplied = dataView?.metadata?.objects
-                ?.["filterState"]?.["applied"] as string ?? "";
-            const savedAppliedLogic = dataView?.metadata?.objects
-                ?.["filterState"]?.["appliedLogic"] as string ?? "AND";
-
-            try {
-                this.conditions = savedConditions ? JSON.parse(savedConditions) : [];
-            } catch {
-                this.conditions = [];
-            }
-            this.logic = savedLogic === "OR" ? "OR" : "AND";
-
-            try {
-                this.appliedConditions = savedApplied ? JSON.parse(savedApplied) : [];
-            } catch {
-                this.appliedConditions = [];
-            }
-            this.appliedLogic = savedAppliedLogic === "OR" ? "OR" : "AND";
-
+            this.restoreState(dataView);
             this.renderFilterPanel();
         }
 
+        this.filteredRows = this.applyFilters();
+        this.currentPage = 0;
         this.renderTable();
+        this.renderPager();
+    }
+
+    private restoreState(dataView: DataView): void {
+        const meta = dataView?.metadata?.objects?.["filterState"];
+        try { this.conditions = meta?.["conditions"] ? JSON.parse(meta["conditions"] as string) : []; }
+        catch { this.conditions = []; }
+        this.logic = (meta?.["logic"] as string) === "OR" ? "OR" : "AND";
+        try { this.appliedConditions = meta?.["applied"] ? JSON.parse(meta["applied"] as string) : []; }
+        catch { this.appliedConditions = []; }
+        this.appliedLogic = (meta?.["appliedLogic"] as string) === "OR" ? "OR" : "AND";
     }
 
     private extractTableData(dataView: DataView): TableData {
         if (!dataView?.table) return { columns: [], rows: [] };
-
         const columns = dataView.table.columns.map(c => c.displayName || "");
         const rows = dataView.table.rows.map(row =>
-            row.map(cell => (cell === null || cell === undefined) ? "" : String(cell))
+            row.map(cell => (cell == null) ? "" : String(cell))
         );
         return { columns, rows };
     }
@@ -118,10 +127,11 @@ export class Visual implements IVisual {
         while (el.firstChild) el.removeChild(el.firstChild);
     }
 
+    // ---- フィルターパネル ----
+
     private renderFilterPanel(): void {
         this.clearElement(this.filterPanel);
 
-        // ヘッダー行（タイトル + AND/OR）
         const header = document.createElement("div");
         header.className = "filter-header";
 
@@ -132,23 +142,16 @@ export class Visual implements IVisual {
 
         const logicToggle = document.createElement("div");
         logicToggle.className = "logic-toggle";
-
-        const andBtn = document.createElement("button");
-        andBtn.textContent = "AND";
-        andBtn.className = "logic-btn" + (this.logic === "AND" ? " active" : "");
-        andBtn.onclick = () => { this.logic = "AND"; this.saveState(); this.renderFilterPanel(); };
-
-        const orBtn = document.createElement("button");
-        orBtn.textContent = "OR";
-        orBtn.className = "logic-btn" + (this.logic === "OR" ? " active" : "");
-        orBtn.onclick = () => { this.logic = "OR"; this.saveState(); this.renderFilterPanel(); };
-
-        logicToggle.appendChild(andBtn);
-        logicToggle.appendChild(orBtn);
+        for (const val of ["AND", "OR"] as const) {
+            const btn = document.createElement("button");
+            btn.textContent = val;
+            btn.className = "logic-btn" + (this.logic === val ? " active" : "");
+            btn.onclick = () => { this.logic = val; this.saveState(); this.renderFilterPanel(); };
+            logicToggle.appendChild(btn);
+        }
         header.appendChild(logicToggle);
         this.filterPanel.appendChild(header);
 
-        // 条件リスト
         const conditionList = document.createElement("div");
         conditionList.className = "condition-list";
         this.conditions.forEach((cond, idx) => {
@@ -156,7 +159,6 @@ export class Visual implements IVisual {
         });
         this.filterPanel.appendChild(conditionList);
 
-        // フッター行（条件追加 + 実行ボタン）
         const footer = document.createElement("div");
         footer.className = "filter-footer";
 
@@ -199,16 +201,13 @@ export class Visual implements IVisual {
 
         const opSelect = document.createElement("select");
         opSelect.className = "op-select";
-        [
-            { value: "contains", label: "を含む" },
-            { value: "notContains", label: "を含まない" },
-        ].forEach(op => {
+        for (const op of [{ value: "contains", label: "を含む" }, { value: "notContains", label: "を含まない" }]) {
             const opt = document.createElement("option");
             opt.value = op.value;
             opt.textContent = op.label;
             if (op.value === cond.operator) opt.selected = true;
             opSelect.appendChild(opt);
-        });
+        }
         opSelect.onchange = () => {
             this.conditions[idx].operator = opSelect.value as "contains" | "notContains";
             this.saveState();
@@ -219,12 +218,10 @@ export class Visual implements IVisual {
         valueInput.className = "value-input";
         valueInput.placeholder = "検索キーワード";
         valueInput.value = cond.value;
-        // 入力中は条件をメモリ更新＋デバウンス保存のみ。テーブルは触らない
         valueInput.oninput = () => {
             this.conditions[idx].value = valueInput.value;
             this.debounceSave();
         };
-        // Enter キーで実行
         valueInput.onkeydown = (e: KeyboardEvent) => {
             if (e.key === "Enter") this.executeSearch();
         };
@@ -232,7 +229,6 @@ export class Visual implements IVisual {
         const removeBtn = document.createElement("button");
         removeBtn.className = "remove-btn";
         removeBtn.textContent = "×";
-        removeBtn.title = "条件を削除";
         removeBtn.onclick = () => {
             this.conditions.splice(idx, 1);
             this.saveState();
@@ -246,20 +242,24 @@ export class Visual implements IVisual {
         return row;
     }
 
-    // 実行ボタン or Enter → 現在の conditions を applied にコピーしてテーブル更新
+    // ---- 実行 ----
+
     private executeSearch(): void {
         this.appliedConditions = this.conditions.map(c => ({ ...c }));
         this.appliedLogic = this.logic;
-        this.persist();
-        this.renderTable();
+        this.filteredRows = this.applyFilters();
+        this.currentPage = 0;
+        this.persist();          // skipTableRender = true にした上で persist
+        this.renderTable();      // 実行後だけテーブルを更新
+        this.renderPager();
     }
 
-    // 条件の構造変更（追加・削除・列・演算子・AND/OR）を即座に保存
+    // ---- 保存 ----
+
     private saveState(): void {
         this.persist();
     }
 
-    // テキスト入力は 800ms デバウンスで保存
     private debounceSave(): void {
         if (this.persistTimer !== null) clearTimeout(this.persistTimer);
         this.persistTimer = window.setTimeout(() => {
@@ -269,6 +269,7 @@ export class Visual implements IVisual {
     }
 
     private persist(): void {
+        this.skipTableRender = true;  // 次の update() でテーブル再描画をスキップ
         this.host.persistProperties({
             merge: [{
                 objectName: "filterState",
@@ -283,11 +284,13 @@ export class Visual implements IVisual {
         });
     }
 
-    private applyFilters(rows: string[][]): string[][] {
-        const active = this.appliedConditions.filter(c => c.value.trim() !== "");
-        if (active.length === 0) return rows;
+    // ---- フィルター処理 ----
 
-        return rows.filter(row => {
+    private applyFilters(): string[][] {
+        const active = this.appliedConditions.filter(c => c.value.trim() !== "");
+        if (active.length === 0) return this.tableData.rows;
+
+        return this.tableData.rows.filter(row => {
             const results = active.map(cond => {
                 const cell = (row[cond.columnIndex] ?? "").toLowerCase();
                 const kw = cond.value.toLowerCase();
@@ -296,6 +299,8 @@ export class Visual implements IVisual {
             return this.appliedLogic === "AND" ? results.every(Boolean) : results.some(Boolean);
         });
     }
+
+    // ---- テーブル描画（現在ページのみ） ----
 
     private renderTable(): void {
         this.clearElement(this.tableContainer);
@@ -309,35 +314,79 @@ export class Visual implements IVisual {
             return;
         }
 
-        const filteredRows = this.applyFilters(this.tableData.rows);
-        this.statusBar.textContent = `${filteredRows.length} / ${this.tableData.rows.length} 件`;
+        const total = this.tableData.rows.length;
+        const filtered = this.filteredRows.length;
+        this.statusBar.textContent = filtered === total
+            ? `${total} 件`
+            : `${filtered} / ${total} 件`;
 
         const table = document.createElement("table");
         table.className = "data-table";
 
+        // ヘッダー
         const thead = document.createElement("thead");
         const headerRow = document.createElement("tr");
+        const hFrag = document.createDocumentFragment();
         this.tableData.columns.forEach(col => {
             const th = document.createElement("th");
             th.textContent = col;
-            headerRow.appendChild(th);
+            hFrag.appendChild(th);
         });
+        headerRow.appendChild(hFrag);
         thead.appendChild(headerRow);
         table.appendChild(thead);
 
+        // ボディ：現在ページ分だけ
+        const start = this.currentPage * PAGE_SIZE;
+        const pageRows = this.filteredRows.slice(start, start + PAGE_SIZE);
+
         const tbody = document.createElement("tbody");
-        filteredRows.forEach((row, rowIdx) => {
+        const bFrag = document.createDocumentFragment();
+        pageRows.forEach((row, i) => {
             const tr = document.createElement("tr");
-            tr.className = rowIdx % 2 === 0 ? "row-even" : "row-odd";
+            tr.className = (start + i) % 2 === 0 ? "row-even" : "row-odd";
+            const rFrag = document.createDocumentFragment();
             row.forEach(cell => {
                 const td = document.createElement("td");
                 td.textContent = cell;
-                tr.appendChild(td);
+                rFrag.appendChild(td);
             });
-            tbody.appendChild(tr);
+            tr.appendChild(rFrag);
+            bFrag.appendChild(tr);
         });
+        tbody.appendChild(bFrag);
         table.appendChild(tbody);
         this.tableContainer.appendChild(table);
+    }
+
+    // ---- ページネーション ----
+
+    private renderPager(): void {
+        this.clearElement(this.pager);
+        const totalPages = Math.ceil(this.filteredRows.length / PAGE_SIZE);
+        if (totalPages <= 1) return;
+
+        const info = document.createElement("span");
+        info.className = "pager-info";
+        info.textContent = `${this.currentPage + 1} / ${totalPages} ページ`;
+
+        const prev = document.createElement("button");
+        prev.className = "pager-btn";
+        prev.textContent = "‹";
+        prev.disabled = this.currentPage === 0;
+        prev.onclick = () => { this.currentPage--; this.renderTable(); this.renderPager(); };
+
+        const next = document.createElement("button");
+        next.className = "pager-btn";
+        next.textContent = "›";
+        next.disabled = this.currentPage >= totalPages - 1;
+        next.onclick = () => { this.currentPage++; this.renderTable(); this.renderPager(); };
+
+        const frag = document.createDocumentFragment();
+        frag.appendChild(prev);
+        frag.appendChild(info);
+        frag.appendChild(next);
+        this.pager.appendChild(frag);
     }
 
     public getFormattingModel(): powerbi.visuals.FormattingModel {

@@ -181,6 +181,39 @@
         text-align: right;
     }
 
+    // ----- ページネーション -----
+    .pager {
+        flex: 0 0 auto;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        padding: 4px 10px;
+        border-top: 1px solid #e0e0e0;
+        background: #f9f9f9;
+
+        .pager-btn {
+            width: 26px;
+            height: 26px;
+            padding: 0;
+            border: 1px solid #c8c8c8;
+            border-radius: 3px;
+            background: #fff;
+            color: #252423;
+            cursor: pointer;
+            font-size: 16px;
+            line-height: 1;
+
+            &:hover:not(:disabled) { background: #e8f4fd; border-color: #0078d4; }
+            &:disabled { color: #c8c8c8; cursor: default; }
+        }
+
+        .pager-info {
+            font-size: 11px;
+            color: #605e5c;
+        }
+    }
+
     // ----- テーブルエリア -----
     .table-container {
         flex: 1 1 auto;
