@@ -8,9 +8,7 @@
     background: #fff;
     overflow: hidden;
 
-    * {
-        box-sizing: border-box;
-    }
+    * { box-sizing: border-box; }
 
     // ----- フィルターパネル -----
     .filter-panel {
@@ -45,15 +43,8 @@
                     border-radius: 3px;
                     transition: background 0.15s, color 0.15s;
 
-                    &.active {
-                        background: #0078d4;
-                        color: #fff;
-                        border-color: #0078d4;
-                    }
-
-                    &:hover:not(.active) {
-                        background: #f0f0f0;
-                    }
+                    &.active { background: #0078d4; color: #fff; border-color: #0078d4; }
+                    &:hover:not(.active) { background: #f0f0f0; }
                 }
             }
         }
@@ -79,48 +70,23 @@
                 background: #fff;
                 outline: none;
 
-                &:focus {
-                    border-color: #0078d4;
-                    box-shadow: 0 0 0 1px #0078d4;
-                }
+                &:focus { border-color: #0078d4; box-shadow: 0 0 0 1px #0078d4; }
             }
 
-            .col-select {
-                flex: 2;
-                min-width: 80px;
-            }
-
-            .op-select {
-                flex: 1.5;
-                min-width: 90px;
-            }
-
-            .value-input {
-                flex: 3;
-                min-width: 80px;
-            }
+            .col-select  { flex: 2; min-width: 80px; }
+            .op-select   { flex: 1.5; min-width: 90px; }
+            .value-input { flex: 3; min-width: 80px; }
 
             .remove-btn {
-                flex: 0 0 auto;
-                width: 26px;
-                height: 26px;
-                padding: 0;
+                flex: 0 0 26px;
+                width: 26px; height: 26px; padding: 0;
                 border: 1px solid #c8c8c8;
                 border-radius: 3px;
-                background: #fff;
-                color: #605e5c;
-                cursor: pointer;
-                font-size: 14px;
-                line-height: 1;
-                display: flex;
-                align-items: center;
-                justify-content: center;
+                background: #fff; color: #605e5c;
+                cursor: pointer; font-size: 14px;
+                display: flex; align-items: center; justify-content: center;
 
-                &:hover {
-                    background: #fde7e9;
-                    border-color: #d13438;
-                    color: #d13438;
-                }
+                &:hover { background: #fde7e9; border-color: #d13438; color: #d13438; }
             }
         }
 
@@ -138,35 +104,23 @@
             border-radius: 3px;
             background: transparent;
             color: #0078d4;
-            cursor: pointer;
-            font-size: 12px;
+            cursor: pointer; font-size: 12px;
             text-align: left;
             transition: background 0.15s;
 
-            &:hover {
-                background: #e8f4fd;
-            }
+            &:hover { background: #e8f4fd; }
         }
 
         .run-btn {
             flex: 0 0 auto;
             padding: 4px 16px;
-            border: none;
-            border-radius: 3px;
-            background: #0078d4;
-            color: #fff;
-            cursor: pointer;
-            font-size: 12px;
-            font-weight: 600;
+            border: none; border-radius: 3px;
+            background: #0078d4; color: #fff;
+            cursor: pointer; font-size: 12px; font-weight: 600;
             transition: background 0.15s;
 
-            &:hover {
-                background: #106ebe;
-            }
-
-            &:active {
-                background: #005a9e;
-            }
+            &:hover  { background: #106ebe; }
+            &:active { background: #005a9e; }
         }
     }
 
@@ -181,93 +135,15 @@
         text-align: right;
     }
 
-    // ----- ページネーション -----
-    .pager {
-        flex: 0 0 auto;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        gap: 8px;
-        padding: 4px 10px;
-        border-top: 1px solid #e0e0e0;
-        background: #f9f9f9;
-
-        .pager-btn {
-            width: 26px;
-            height: 26px;
-            padding: 0;
-            border: 1px solid #c8c8c8;
-            border-radius: 3px;
-            background: #fff;
-            color: #252423;
-            cursor: pointer;
-            font-size: 16px;
-            line-height: 1;
-
-            &:hover:not(:disabled) { background: #e8f4fd; border-color: #0078d4; }
-            &:disabled { color: #c8c8c8; cursor: default; }
-        }
-
-        .pager-info {
-            font-size: 11px;
-            color: #605e5c;
-        }
-    }
-
-    // ----- テーブルエリア -----
-    .table-container {
+    // ----- Canvas エリア -----
+    .canvas-area {
         flex: 1 1 auto;
-        overflow: auto;
+        position: relative;
+        overflow: hidden;
 
-        .no-data {
-            padding: 24px;
-            text-align: center;
-            color: #a19f9d;
-            font-size: 13px;
-        }
-
-        .data-table {
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 12px;
-
-            thead {
-                position: sticky;
-                top: 0;
-                z-index: 1;
-
-                th {
-                    padding: 6px 10px;
-                    background: #f2f2f2;
-                    border-bottom: 2px solid #d1d1d1;
-                    text-align: left;
-                    font-weight: 600;
-                    color: #252423;
-                    white-space: nowrap;
-                }
-            }
-
-            tbody {
-                tr {
-                    &.row-even {
-                        background: #fff;
-                    }
-                    &.row-odd {
-                        background: #fafafa;
-                    }
-                    &:hover {
-                        background: #e8f4fd;
-                    }
-
-                    td {
-                        padding: 5px 10px;
-                        border-bottom: 1px solid #f0f0f0;
-                        color: #252423;
-                        vertical-align: top;
-                        word-break: break-all;
-                    }
-                }
-            }
+        canvas {
+            display: block;
+            cursor: default;
         }
     }
 }

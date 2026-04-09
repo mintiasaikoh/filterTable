@@ -12,7 +12,22 @@ import DataView = powerbi.DataView;
 
 import { VisualFormattingSettingsModel } from "./settings";
 
-const PAGE_SIZE = 100;
+// --- Canvas 定数 ---
+const ROW_H      = 22;
+const HEADER_H   = 28;
+const SB_W       = 10;   // スクロールバー幅
+const CELL_PAD   = 8;
+const FONT       = "12px 'Segoe UI',sans-serif";
+const FONT_HDR   = "600 12px 'Segoe UI',sans-serif";
+const C_HDR_BG   = "#f2f2f2";
+const C_ROW_EVEN = "#ffffff";
+const C_ROW_ODD  = "#fafafa";
+const C_ROW_HOV  = "#e8f4fd";
+const C_TEXT     = "#252423";
+const C_BORDER   = "#e0e0e0";
+const C_HDR_LINE = "#d1d1d1";
+const C_SB_TRACK = "#f0f0f0";
+const C_SB_THUMB = "#c8c8c8";
 
 interface FilterCondition {
     columnIndex: number;
@@ -31,21 +46,35 @@ export class Visual implements IVisual {
     private formattingSettings: VisualFormattingSettingsModel;
     private formattingSettingsService: FormattingSettingsService;
 
-    private conditions: FilterCondition[] = [];
-    private logic: "AND" | "OR" = "AND";
-    private tableData: TableData = { columns: [], rows: [] };
+    private conditions: FilterCondition[]        = [];
+    private logic: "AND" | "OR"                  = "AND";
+    private tableData: TableData                 = { columns: [], rows: [] };
     private appliedConditions: FilterCondition[] = [];
-    private appliedLogic: "AND" | "OR" = "AND";
-    private filteredRows: string[][] = [];
-    private currentPage = 0;
+    private appliedLogic: "AND" | "OR"           = "AND";
+    private filteredRows: string[][]             = [];
 
-    private filterPanel: HTMLElement;
-    private tableContainer: HTMLElement;
-    private statusBar: HTMLElement;
-    private pager: HTMLElement;
+    // --- DOM ---
+    private filterPanel:   HTMLElement;
+    private statusBar:     HTMLElement;
+    private canvasArea:    HTMLElement;
+    private canvas:        HTMLCanvasElement;
+    private ctx:           CanvasRenderingContext2D;
 
-    // 自分の persist 呼び出しによる update サイクルでテーブルを再描画しないフラグ
-    private skipTableRender = false;
+    // --- Canvas 状態 ---
+    private scrollTop    = 0;
+    private hoveredRow   = -1;
+    private colWidths:     number[] = [];
+    private logicalW     = 0;   // CSS px
+    private logicalH     = 0;
+    private drawPending  = false;
+
+    // --- スクロールバードラッグ ---
+    private isDragging   = false;
+    private dragStartY   = 0;
+    private dragStartScroll = 0;
+
+    // --- 自分の persist による update を無視するフラグ ---
+    private skipRender   = false;
     private persistTimer: number | null = null;
 
     constructor(options: VisualConstructorOptions) {
@@ -54,6 +83,7 @@ export class Visual implements IVisual {
         this.target = options.element;
         this.target.className = "filter-table-visual";
         this.buildLayout();
+        this.setupCanvasEvents();
     }
 
     private buildLayout(): void {
@@ -63,55 +93,57 @@ export class Visual implements IVisual {
         this.statusBar = document.createElement("div");
         this.statusBar.className = "status-bar";
 
-        this.tableContainer = document.createElement("div");
-        this.tableContainer.className = "table-container";
+        this.canvasArea = document.createElement("div");
+        this.canvasArea.className = "canvas-area";
 
-        this.pager = document.createElement("div");
-        this.pager.className = "pager";
+        this.canvas = document.createElement("canvas");
+        this.canvasArea.appendChild(this.canvas);
+        this.ctx = this.canvas.getContext("2d");
 
         this.target.appendChild(this.filterPanel);
         this.target.appendChild(this.statusBar);
-        this.target.appendChild(this.tableContainer);
-        this.target.appendChild(this.pager);
+        this.target.appendChild(this.canvasArea);
     }
 
+    // =========================================================
+    // update
+    // =========================================================
     public update(options: VisualUpdateOptions): void {
         this.formattingSettings = this.formattingSettingsService
             .populateFormattingSettingsModel(VisualFormattingSettingsModel, options.dataViews?.[0]);
 
         const dataView: DataView = options.dataViews?.[0];
 
-        // 自分の persist による update は無視（テーブル再描画なし）
-        if (this.skipTableRender) {
-            this.skipTableRender = false;
-            // パネルだけ再描画（データは変わっていないので tableData は更新不要）
-            const isTyping = this.filterPanel.querySelector("input:focus") !== null;
+        if (this.skipRender) {
+            this.skipRender = false;
+            const isTyping = !!this.filterPanel.querySelector("input:focus");
             if (!isTyping) this.renderFilterPanel();
             return;
         }
 
         this.tableData = this.extractTableData(dataView);
 
-        const isTyping = this.filterPanel.querySelector("input:focus") !== null;
+        const isTyping = !!this.filterPanel.querySelector("input:focus");
         if (!isTyping) {
             this.restoreState(dataView);
             this.renderFilterPanel();
         }
 
         this.filteredRows = this.applyFilters();
-        this.currentPage = 0;
-        this.renderTable();
-        this.renderPager();
+        this.scrollTop = 0;
+        this.updateStatus();
+        this.resizeCanvas();   // canvas サイズを合わせてから描画
+        this.scheduleRedraw();
     }
 
     private restoreState(dataView: DataView): void {
-        const meta = dataView?.metadata?.objects?.["filterState"];
-        try { this.conditions = meta?.["conditions"] ? JSON.parse(meta["conditions"] as string) : []; }
+        const m = dataView?.metadata?.objects?.["filterState"];
+        try   { this.conditions = m?.["conditions"] ? JSON.parse(m["conditions"] as string) : []; }
         catch { this.conditions = []; }
-        this.logic = (meta?.["logic"] as string) === "OR" ? "OR" : "AND";
-        try { this.appliedConditions = meta?.["applied"] ? JSON.parse(meta["applied"] as string) : []; }
+        this.logic = (m?.["logic"] as string) === "OR" ? "OR" : "AND";
+        try   { this.appliedConditions = m?.["applied"] ? JSON.parse(m["applied"] as string) : []; }
         catch { this.appliedConditions = []; }
-        this.appliedLogic = (meta?.["appliedLogic"] as string) === "OR" ? "OR" : "AND";
+        this.appliedLogic = (m?.["appliedLogic"] as string) === "OR" ? "OR" : "AND";
     }
 
     private extractTableData(dataView: DataView): TableData {
@@ -123,14 +155,15 @@ export class Visual implements IVisual {
         return { columns, rows };
     }
 
-    private clearElement(el: HTMLElement): void {
+    // =========================================================
+    // フィルターパネル（HTML DOM）
+    // =========================================================
+    private clearEl(el: HTMLElement): void {
         while (el.firstChild) el.removeChild(el.firstChild);
     }
 
-    // ---- フィルターパネル ----
-
     private renderFilterPanel(): void {
-        this.clearElement(this.filterPanel);
+        this.clearEl(this.filterPanel);
 
         const header = document.createElement("div");
         header.className = "filter-header";
@@ -140,24 +173,22 @@ export class Visual implements IVisual {
         title.textContent = "フィルター";
         header.appendChild(title);
 
-        const logicToggle = document.createElement("div");
-        logicToggle.className = "logic-toggle";
-        for (const val of ["AND", "OR"] as const) {
+        const toggle = document.createElement("div");
+        toggle.className = "logic-toggle";
+        for (const v of ["AND", "OR"] as const) {
             const btn = document.createElement("button");
-            btn.textContent = val;
-            btn.className = "logic-btn" + (this.logic === val ? " active" : "");
-            btn.onclick = () => { this.logic = val; this.saveState(); this.renderFilterPanel(); };
-            logicToggle.appendChild(btn);
+            btn.textContent = v;
+            btn.className = "logic-btn" + (this.logic === v ? " active" : "");
+            btn.onclick = () => { this.logic = v; this.saveState(); this.renderFilterPanel(); };
+            toggle.appendChild(btn);
         }
-        header.appendChild(logicToggle);
+        header.appendChild(toggle);
         this.filterPanel.appendChild(header);
 
-        const conditionList = document.createElement("div");
-        conditionList.className = "condition-list";
-        this.conditions.forEach((cond, idx) => {
-            conditionList.appendChild(this.createConditionRow(cond, idx));
-        });
-        this.filterPanel.appendChild(conditionList);
+        const list = document.createElement("div");
+        list.className = "condition-list";
+        this.conditions.forEach((c, i) => list.appendChild(this.makeConditionRow(c, i)));
+        this.filterPanel.appendChild(list);
 
         const footer = document.createElement("div");
         footer.className = "filter-footer";
@@ -181,212 +212,288 @@ export class Visual implements IVisual {
         this.filterPanel.appendChild(footer);
     }
 
-    private createConditionRow(cond: FilterCondition, idx: number): HTMLElement {
+    private makeConditionRow(cond: FilterCondition, idx: number): HTMLElement {
         const row = document.createElement("div");
         row.className = "condition-row";
 
-        const colSelect = document.createElement("select");
-        colSelect.className = "col-select";
+        const colSel = document.createElement("select");
+        colSel.className = "col-select";
         this.tableData.columns.forEach((col, i) => {
-            const opt = document.createElement("option");
-            opt.value = String(i);
-            opt.textContent = col;
-            if (i === cond.columnIndex) opt.selected = true;
-            colSelect.appendChild(opt);
+            const o = document.createElement("option");
+            o.value = String(i); o.textContent = col;
+            if (i === cond.columnIndex) o.selected = true;
+            colSel.appendChild(o);
         });
-        colSelect.onchange = () => {
-            this.conditions[idx].columnIndex = parseInt(colSelect.value, 10);
-            this.saveState();
-        };
+        colSel.onchange = () => { this.conditions[idx].columnIndex = +colSel.value; this.saveState(); };
 
-        const opSelect = document.createElement("select");
-        opSelect.className = "op-select";
-        for (const op of [{ value: "contains", label: "を含む" }, { value: "notContains", label: "を含まない" }]) {
-            const opt = document.createElement("option");
-            opt.value = op.value;
-            opt.textContent = op.label;
-            if (op.value === cond.operator) opt.selected = true;
-            opSelect.appendChild(opt);
+        const opSel = document.createElement("select");
+        opSel.className = "op-select";
+        for (const op of [{ v: "contains", l: "を含む" }, { v: "notContains", l: "を含まない" }]) {
+            const o = document.createElement("option");
+            o.value = op.v; o.textContent = op.l;
+            if (op.v === cond.operator) o.selected = true;
+            opSel.appendChild(o);
         }
-        opSelect.onchange = () => {
-            this.conditions[idx].operator = opSelect.value as "contains" | "notContains";
-            this.saveState();
-        };
+        opSel.onchange = () => { this.conditions[idx].operator = opSel.value as "contains" | "notContains"; this.saveState(); };
 
-        const valueInput = document.createElement("input");
-        valueInput.type = "text";
-        valueInput.className = "value-input";
-        valueInput.placeholder = "検索キーワード";
-        valueInput.value = cond.value;
-        valueInput.oninput = () => {
-            this.conditions[idx].value = valueInput.value;
-            this.debounceSave();
-        };
-        valueInput.onkeydown = (e: KeyboardEvent) => {
-            if (e.key === "Enter") this.executeSearch();
-        };
+        const inp = document.createElement("input");
+        inp.type = "text"; inp.className = "value-input";
+        inp.placeholder = "検索キーワード"; inp.value = cond.value;
+        inp.oninput    = () => { this.conditions[idx].value = inp.value; this.debounceSave(); };
+        inp.onkeydown  = (e: KeyboardEvent) => { if (e.key === "Enter") this.executeSearch(); };
 
-        const removeBtn = document.createElement("button");
-        removeBtn.className = "remove-btn";
-        removeBtn.textContent = "×";
-        removeBtn.onclick = () => {
-            this.conditions.splice(idx, 1);
-            this.saveState();
-            this.renderFilterPanel();
-        };
+        const del = document.createElement("button");
+        del.className = "remove-btn"; del.textContent = "×";
+        del.onclick = () => { this.conditions.splice(idx, 1); this.saveState(); this.renderFilterPanel(); };
 
-        row.appendChild(colSelect);
-        row.appendChild(opSelect);
-        row.appendChild(valueInput);
-        row.appendChild(removeBtn);
+        row.appendChild(colSel); row.appendChild(opSel); row.appendChild(inp); row.appendChild(del);
         return row;
     }
-
-    // ---- 実行 ----
 
     private executeSearch(): void {
         this.appliedConditions = this.conditions.map(c => ({ ...c }));
         this.appliedLogic = this.logic;
         this.filteredRows = this.applyFilters();
-        this.currentPage = 0;
-        this.persist();          // skipTableRender = true にした上で persist
-        this.renderTable();      // 実行後だけテーブルを更新
-        this.renderPager();
-    }
-
-    // ---- 保存 ----
-
-    private saveState(): void {
+        this.scrollTop = 0;
         this.persist();
+        this.updateStatus();
+        this.scheduleRedraw();
     }
+
+    private saveState(): void  { this.persist(); }
 
     private debounceSave(): void {
         if (this.persistTimer !== null) clearTimeout(this.persistTimer);
-        this.persistTimer = window.setTimeout(() => {
-            this.persistTimer = null;
-            this.persist();
-        }, 800);
+        this.persistTimer = window.setTimeout(() => { this.persistTimer = null; this.persist(); }, 800);
     }
 
     private persist(): void {
-        this.skipTableRender = true;  // 次の update() でテーブル再描画をスキップ
+        this.skipRender = true;
         this.host.persistProperties({
-            merge: [{
-                objectName: "filterState",
-                selector: null,
-                properties: {
-                    conditions: JSON.stringify(this.conditions),
-                    logic: this.logic,
-                    applied: JSON.stringify(this.appliedConditions),
-                    appliedLogic: this.appliedLogic,
-                },
-            }],
+            merge: [{ objectName: "filterState", selector: null, properties: {
+                conditions:    JSON.stringify(this.conditions),
+                logic:         this.logic,
+                applied:       JSON.stringify(this.appliedConditions),
+                appliedLogic:  this.appliedLogic,
+            }}],
         });
     }
-
-    // ---- フィルター処理 ----
 
     private applyFilters(): string[][] {
         const active = this.appliedConditions.filter(c => c.value.trim() !== "");
-        if (active.length === 0) return this.tableData.rows;
-
+        if (!active.length) return this.tableData.rows;
         return this.tableData.rows.filter(row => {
-            const results = active.map(cond => {
-                const cell = (row[cond.columnIndex] ?? "").toLowerCase();
-                const kw = cond.value.toLowerCase();
-                return cond.operator === "contains" ? cell.includes(kw) : !cell.includes(kw);
+            const res = active.map(c => {
+                const cell = (row[c.columnIndex] ?? "").toLowerCase();
+                const kw = c.value.toLowerCase();
+                return c.operator === "contains" ? cell.includes(kw) : !cell.includes(kw);
             });
-            return this.appliedLogic === "AND" ? results.every(Boolean) : results.some(Boolean);
+            return this.appliedLogic === "AND" ? res.every(Boolean) : res.some(Boolean);
         });
     }
 
-    // ---- テーブル描画（現在ページのみ） ----
+    private updateStatus(): void {
+        const f = this.filteredRows.length, t = this.tableData.rows.length;
+        this.statusBar.textContent = f === t ? `${t} 件` : `${f} / ${t} 件`;
+    }
 
-    private renderTable(): void {
-        this.clearElement(this.tableContainer);
+    // =========================================================
+    // Canvas 描画
+    // =========================================================
+    private resizeCanvas(): void {
+        const w = this.canvasArea.clientWidth;
+        const h = this.canvasArea.clientHeight;
+        if (w <= 0 || h <= 0) return;
+        const dpr = window.devicePixelRatio || 1;
+        this.canvas.width  = Math.round(w * dpr);
+        this.canvas.height = Math.round(h * dpr);
+        this.canvas.style.width  = w + "px";
+        this.canvas.style.height = h + "px";
+        this.logicalW = w;
+        this.logicalH = h;
+        this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        this.calcColWidths(w - SB_W);
+    }
 
-        if (this.tableData.columns.length === 0) {
-            const msg = document.createElement("div");
-            msg.className = "no-data";
-            msg.textContent = "データをフィールドに追加してください";
-            this.tableContainer.appendChild(msg);
-            this.statusBar.textContent = "";
+    private calcColWidths(tableW: number): void {
+        const cols = this.tableData.columns;
+        if (!cols.length) { this.colWidths = []; return; }
+
+        const ctx = this.ctx;
+        const min = 50, max = 280;
+
+        ctx.font = FONT_HDR;
+        const ws = cols.map(c => Math.min(max, Math.max(min, ctx.measureText(c).width + CELL_PAD * 2 + 12)));
+
+        ctx.font = FONT;
+        const sample = this.filteredRows.length > 300 ? this.filteredRows.slice(0, 300) : this.filteredRows;
+        for (const row of sample) {
+            for (let i = 0; i < row.length; i++) {
+                const w = Math.min(max, ctx.measureText(row[i]).width + CELL_PAD * 2);
+                if (w > ws[i]) ws[i] = w;
+            }
+        }
+
+        // 余白があれば均等に広げる
+        const total = ws.reduce((s, w) => s + w, 0);
+        if (total < tableW && cols.length > 0) {
+            const extra = (tableW - total) / cols.length;
+            for (let i = 0; i < ws.length; i++) ws[i] += extra;
+        }
+        this.colWidths = ws;
+    }
+
+    private scheduleRedraw(): void {
+        if (this.drawPending) return;
+        this.drawPending = true;
+        requestAnimationFrame(() => { this.drawPending = false; this.draw(); });
+    }
+
+    private maxScroll(): number {
+        return Math.max(0, this.filteredRows.length * ROW_H - (this.logicalH - HEADER_H));
+    }
+
+    private draw(): void {
+        const ctx = this.ctx;
+        const W = this.logicalW, H = this.logicalH;
+        if (W <= 0 || H <= 0) return;
+
+        ctx.clearRect(0, 0, W, H);
+
+        if (!this.tableData.columns.length) {
+            ctx.fillStyle = "#a19f9d"; ctx.font = FONT;
+            ctx.textAlign = "center"; ctx.textBaseline = "middle";
+            ctx.fillText("データをフィールドに追加してください", W / 2, H / 2);
             return;
         }
 
-        const total = this.tableData.rows.length;
-        const filtered = this.filteredRows.length;
-        this.statusBar.textContent = filtered === total
-            ? `${total} 件`
-            : `${filtered} / ${total} 件`;
+        const tW = W - SB_W;   // テーブル描画幅
 
-        const table = document.createElement("table");
-        table.className = "data-table";
+        this.drawHeader(ctx, tW);
+        this.drawBody(ctx, tW);
+        this.drawScrollbar(ctx, W, H);
 
-        // ヘッダー
-        const thead = document.createElement("thead");
-        const headerRow = document.createElement("tr");
-        const hFrag = document.createDocumentFragment();
-        this.tableData.columns.forEach(col => {
-            const th = document.createElement("th");
-            th.textContent = col;
-            hFrag.appendChild(th);
-        });
-        headerRow.appendChild(hFrag);
-        thead.appendChild(headerRow);
-        table.appendChild(thead);
-
-        // ボディ：現在ページ分だけ
-        const start = this.currentPage * PAGE_SIZE;
-        const pageRows = this.filteredRows.slice(start, start + PAGE_SIZE);
-
-        const tbody = document.createElement("tbody");
-        const bFrag = document.createDocumentFragment();
-        pageRows.forEach((row, i) => {
-            const tr = document.createElement("tr");
-            tr.className = (start + i) % 2 === 0 ? "row-even" : "row-odd";
-            const rFrag = document.createDocumentFragment();
-            row.forEach(cell => {
-                const td = document.createElement("td");
-                td.textContent = cell;
-                rFrag.appendChild(td);
-            });
-            tr.appendChild(rFrag);
-            bFrag.appendChild(tr);
-        });
-        tbody.appendChild(bFrag);
-        table.appendChild(tbody);
-        this.tableContainer.appendChild(table);
+        // ヘッダー下のボーダー
+        ctx.strokeStyle = C_HDR_LINE; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(0, HEADER_H); ctx.lineTo(tW, HEADER_H); ctx.stroke();
     }
 
-    // ---- ページネーション ----
+    private drawHeader(ctx: CanvasRenderingContext2D, tW: number): void {
+        ctx.fillStyle = C_HDR_BG;
+        ctx.fillRect(0, 0, tW, HEADER_H);
 
-    private renderPager(): void {
-        this.clearElement(this.pager);
-        const totalPages = Math.ceil(this.filteredRows.length / PAGE_SIZE);
-        if (totalPages <= 1) return;
+        ctx.font = FONT_HDR; ctx.fillStyle = C_TEXT;
+        ctx.textBaseline = "middle"; ctx.textAlign = "left";
 
-        const info = document.createElement("span");
-        info.className = "pager-info";
-        info.textContent = `${this.currentPage + 1} / ${totalPages} ページ`;
+        let x = 0;
+        this.tableData.columns.forEach((col, i) => {
+            const cw = this.colWidths[i];
+            ctx.save();
+            ctx.beginPath(); ctx.rect(x + CELL_PAD, 0, cw - CELL_PAD * 2, HEADER_H); ctx.clip();
+            ctx.fillText(col, x + CELL_PAD, HEADER_H / 2);
+            ctx.restore();
+            // 列区切り線
+            ctx.strokeStyle = C_HDR_LINE; ctx.lineWidth = 1;
+            ctx.beginPath(); ctx.moveTo(x + cw - 0.5, 2); ctx.lineTo(x + cw - 0.5, HEADER_H - 2); ctx.stroke();
+            x += cw;
+        });
+    }
 
-        const prev = document.createElement("button");
-        prev.className = "pager-btn";
-        prev.textContent = "‹";
-        prev.disabled = this.currentPage === 0;
-        prev.onclick = () => { this.currentPage--; this.renderTable(); this.renderPager(); };
+    private drawBody(ctx: CanvasRenderingContext2D, tW: number): void {
+        const bodyH = this.logicalH - HEADER_H;
+        const first = Math.floor(this.scrollTop / ROW_H);
+        const last  = Math.min(this.filteredRows.length, first + Math.ceil(bodyH / ROW_H) + 1);
 
-        const next = document.createElement("button");
-        next.className = "pager-btn";
-        next.textContent = "›";
-        next.disabled = this.currentPage >= totalPages - 1;
-        next.onclick = () => { this.currentPage++; this.renderTable(); this.renderPager(); };
+        ctx.save();
+        ctx.beginPath(); ctx.rect(0, HEADER_H, tW, bodyH); ctx.clip();
+        ctx.font = FONT; ctx.textBaseline = "middle"; ctx.textAlign = "left";
 
-        const frag = document.createDocumentFragment();
-        frag.appendChild(prev);
-        frag.appendChild(info);
-        frag.appendChild(next);
-        this.pager.appendChild(frag);
+        for (let ri = first; ri < last; ri++) {
+            const y = HEADER_H + ri * ROW_H - this.scrollTop;
+            ctx.fillStyle = ri === this.hoveredRow ? C_ROW_HOV : (ri % 2 === 0 ? C_ROW_EVEN : C_ROW_ODD);
+            ctx.fillRect(0, y, tW, ROW_H);
+
+            // 行下線
+            ctx.strokeStyle = C_BORDER; ctx.lineWidth = 1;
+            ctx.beginPath(); ctx.moveTo(0, y + ROW_H); ctx.lineTo(tW, y + ROW_H); ctx.stroke();
+
+            ctx.fillStyle = C_TEXT;
+            let x = 0;
+            const row = this.filteredRows[ri];
+            for (let ci = 0; ci < row.length; ci++) {
+                const cw = this.colWidths[ci];
+                ctx.save();
+                ctx.beginPath(); ctx.rect(x + CELL_PAD, y, cw - CELL_PAD * 2, ROW_H); ctx.clip();
+                ctx.fillText(row[ci], x + CELL_PAD, y + ROW_H / 2);
+                ctx.restore();
+                x += cw;
+            }
+        }
+        ctx.restore();
+    }
+
+    private drawScrollbar(ctx: CanvasRenderingContext2D, W: number, H: number): void {
+        const bodyH   = H - HEADER_H;
+        const totalH  = this.filteredRows.length * ROW_H;
+        const trackX  = W - SB_W;
+        const trackY  = HEADER_H;
+
+        // トラック
+        ctx.fillStyle = C_SB_TRACK;
+        ctx.fillRect(trackX, trackY, SB_W, bodyH);
+
+        if (totalH <= bodyH) return;
+
+        const thumbH = Math.max(24, (bodyH / totalH) * bodyH);
+        const thumbY = trackY + (this.scrollTop / this.maxScroll()) * (bodyH - thumbH);
+
+        ctx.fillStyle = C_SB_THUMB;
+        ctx.beginPath();
+        ctx.roundRect(trackX + 2, thumbY + 1, SB_W - 4, thumbH - 2, 3);
+        ctx.fill();
+    }
+
+    // =========================================================
+    // Canvas イベント
+    // =========================================================
+    private setupCanvasEvents(): void {
+        this.canvas.addEventListener("wheel", (e: WheelEvent) => {
+            e.preventDefault();
+            this.scrollTop = Math.max(0, Math.min(this.scrollTop + e.deltaY, this.maxScroll()));
+            this.scheduleRedraw();
+        }, { passive: false });
+
+        this.canvas.addEventListener("mousemove", (e: MouseEvent) => {
+            const rect = this.canvas.getBoundingClientRect();
+            const y    = e.clientY - rect.top;
+            const prev = this.hoveredRow;
+            this.hoveredRow = y < HEADER_H ? -1 : Math.floor((y - HEADER_H + this.scrollTop) / ROW_H);
+            if (this.hoveredRow !== prev) this.scheduleRedraw();
+
+            // スクロールバードラッグ中
+            if (this.isDragging) {
+                const dy     = y - this.dragStartY;
+                const bodyH  = this.logicalH - HEADER_H;
+                const totalH = this.filteredRows.length * ROW_H;
+                const ratio  = totalH / bodyH;
+                this.scrollTop = Math.max(0, Math.min(this.dragStartScroll + dy * ratio, this.maxScroll()));
+                this.scheduleRedraw();
+            }
+        });
+
+        this.canvas.addEventListener("mousedown", (e: MouseEvent) => {
+            const rect = this.canvas.getBoundingClientRect();
+            const x    = e.clientX - rect.left;
+            if (x >= this.logicalW - SB_W) {
+                this.isDragging      = true;
+                this.dragStartY      = e.clientY - rect.top;
+                this.dragStartScroll = this.scrollTop;
+            }
+        });
+
+        const endDrag = () => { this.isDragging = false; };
+        this.canvas.addEventListener("mouseup",    endDrag);
+        this.canvas.addEventListener("mouseleave", () => { endDrag(); this.hoveredRow = -1; this.scheduleRedraw(); });
     }
 
     public getFormattingModel(): powerbi.visuals.FormattingModel {
