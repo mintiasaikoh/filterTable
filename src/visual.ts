@@ -136,8 +136,12 @@ export class Visual implements IVisual {
         this.tableData = this.extractTableData(dv);
         this.buildSelectionIds(dv);
 
-        if (this.visibleCols.length !== this.tableData.columns.length)
-            this.visibleCols = this.tableData.columns.map(() => true);
+        // 列が増えた分は true、減った分は切り詰め（既存の表示設定を保持）
+        if (this.visibleCols.length !== this.tableData.columns.length) {
+            this.visibleCols = this.tableData.columns.map((_, i) =>
+                this.visibleCols[i] !== undefined ? this.visibleCols[i] : true
+            );
+        }
 
         if (!this.filterPanel.querySelector("input:focus")) {
             this.restoreState(dv);
@@ -153,11 +157,17 @@ export class Visual implements IVisual {
     }
 
     private restoreState(dv: DataView): void {
-        const m = dv?.metadata?.objects?.["filterState"];
-        try   { this.conditions = m?.["conditions"] ? JSON.parse(m["conditions"] as string) : []; }
+        const m   = dv?.metadata?.objects?.["filterState"];
+        const len = this.tableData.columns.length;
+
+        // 列数を超える columnIndex の条件は除外（列を削減したときの不整合対策）
+        const sanitize = (arr: FilterCondition[]) =>
+            arr.filter(c => c.columnIndex >= 0 && c.columnIndex < len);
+
+        try   { this.conditions = sanitize(m?.["conditions"] ? JSON.parse(m["conditions"] as string) : []); }
         catch { this.conditions = []; }
         this.logic = (m?.["logic"] as string) === "OR" ? "OR" : "AND";
-        try   { this.appliedConditions = m?.["applied"] ? JSON.parse(m["applied"] as string) : []; }
+        try   { this.appliedConditions = sanitize(m?.["applied"] ? JSON.parse(m["applied"] as string) : []); }
         catch { this.appliedConditions = []; }
         this.appliedLogic = (m?.["appliedLogic"] as string) === "OR" ? "OR" : "AND";
     }
@@ -402,24 +412,33 @@ export class Visual implements IVisual {
 
     private calcColWidths(availW: number): void {
         const vis = this.tableData.columns.map((_, i) => i).filter(i => this.visibleCols[i]);
-        if (!vis.length) { this.colWidths = []; return; }
+        if (!vis.length || availW <= 0) { this.colWidths = this.tableData.columns.map(() => 0); return; }
+
         const ctx = this.ctx;
         const ws: Record<number, number> = {};
         ctx.font = FONT_HDR;
-        vis.forEach(i => { ws[i] = Math.min(280, Math.max(50, ctx.measureText(this.tableData.columns[i]).width + PAD * 2 + 12)); });
+        vis.forEach(i => {
+            ws[i] = Math.min(280, Math.max(50, ctx.measureText(this.tableData.columns[i]).width + PAD * 2 + 12));
+        });
         ctx.font = FONT;
-        const sample = this.filteredRows.slice(0, 300);
-        for (const row of sample) {
+        for (const row of this.filteredRows.slice(0, 300)) {
             vis.forEach(i => {
                 const w = Math.min(280, ctx.measureText(row[i] ?? "").width + PAD * 2);
                 if (w > ws[i]) ws[i] = w;
             });
         }
+
         const total = vis.reduce((s, i) => s + ws[i], 0);
-        if (total < availW) {
+        if (total <= availW) {
+            // 余白を均等配分
             const extra = (availW - total) / vis.length;
             vis.forEach(i => ws[i] += extra);
+        } else {
+            // 列が多すぎる場合は比率で縮小（最小 40px を保証）
+            const scale = availW / total;
+            vis.forEach(i => { ws[i] = Math.max(40, Math.floor(ws[i] * scale)); });
         }
+
         this.colWidths = this.tableData.columns.map((_, i) => ws[i] ?? 0);
     }
 
@@ -462,7 +481,8 @@ export class Visual implements IVisual {
         const vis = this.tableData.columns.map((_, i) => i).filter(i => this.visibleCols[i]);
         let x = CB_W;
         vis.forEach(i => {
-            const cw = this.colWidths[i];
+            const cw = this.colWidths[i] ?? 0;
+            if (cw <= 0) return;
             ctx.save(); ctx.beginPath(); ctx.rect(x + PAD, 0, cw - PAD * 2, HEADER_H); ctx.clip();
             ctx.fillText(this.tableData.columns[i], x + PAD, HEADER_H / 2); ctx.restore();
             ctx.strokeStyle = C.hdrLine; ctx.lineWidth = 1;
@@ -481,6 +501,7 @@ export class Visual implements IVisual {
         ctx.font = FONT; ctx.textBaseline = "middle"; ctx.textAlign = "left";
 
         for (let ri = first; ri < last; ri++) {
+            if (ri >= this.filteredOrigIdx.length) break;   // 境界保護
             const y   = HEADER_H + ri * ROW_H - this.scrollTop;
             const oi  = this.filteredOrigIdx[ri];
             const sel = this.selectedOrigIdx.has(oi);
@@ -496,7 +517,8 @@ export class Visual implements IVisual {
             let x = CB_W;
             const row = this.filteredRows[ri];
             vis.forEach(i => {
-                const cw = this.colWidths[i];
+                const cw = this.colWidths[i] ?? 0;
+                if (cw <= 0) return;
                 ctx.save(); ctx.beginPath(); ctx.rect(x + PAD, y, cw - PAD * 2, ROW_H); ctx.clip();
                 ctx.fillText(row[i] ?? "", x + PAD, y + ROW_H / 2); ctx.restore();
                 x += cw;
