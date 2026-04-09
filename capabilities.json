@@ -1,0 +1,34 @@
+{
+    "dataRoles": [
+        {
+            "displayName": "列",
+            "name": "values",
+            "kind": "GroupingOrMeasure"
+        }
+    ],
+    "objects": {
+        "filterState": {
+            "properties": {
+                "conditions": {
+                    "displayName": "フィルター条件",
+                    "type": { "text": true }
+                },
+                "logic": {
+                    "displayName": "論理演算子",
+                    "type": { "text": true }
+                }
+            }
+        }
+    },
+    "dataViewMappings": [
+        {
+            "table": {
+                "rows": {
+                    "for": { "in": "values" },
+                    "dataReductionAlgorithm": { "top": { "count": 10000 } }
+                }
+            }
+        }
+    ],
+    "privileges": []
+}

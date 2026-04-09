@@ -1,0 +1,17 @@
+{
+		"version": "1.0.0.0",
+		"author": {"name":"Custom Visual","email":"custom@example.com"},
+		"resources": [
+			{
+				"resourceId": "rId0",
+				"sourceType": 5,
+				"file": "resources/filterTable2CD65A354D634F2D848439FC68485AF0.pbiviz.json"
+			}
+		],
+		"visual": {"name":"filterTable","displayName":"フィルターテーブル","guid":"filterTable2CD65A354D634F2D848439FC68485AF0","visualClassName":"Visual","version":"1.0.0.0","description":"含む/含まない条件でフィルタリングできるテーブルビジュアル","supportUrl":"https://example.com","gitHubUrl":""},
+		"metadata": {
+			"pbivizjson": {
+				"resourceId": "rId0"
+			}
+		}
+	}
