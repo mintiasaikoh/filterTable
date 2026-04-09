@@ -2,7 +2,7 @@
 
 import powerbi from "powerbi-visuals-api";
 import { FormattingSettingsService } from "powerbi-visuals-utils-formattingmodel";
-import { BasicFilter, IFilterColumnTarget, FilterType } from "powerbi-models";
+import { BasicFilter, IFilterColumnTarget } from "powerbi-models";
 import "./../style/visual.less";
 
 import VisualConstructorOptions = powerbi.extensibility.visual.VisualConstructorOptions;
@@ -148,14 +148,15 @@ export class Visual implements IVisual {
         if (rowsChanged) {
             this.scrollEl.scrollTop = 0;
             if (this.selfFilterApplied) {
-                // フィルター後の新データで selectedValues を元に selectedOrigIdx を再構築
+                // 自分で applyJsonFilter した直後：selectedValues を元にインデックスを再マップ
                 this.rebuildSelectionFromValues();
             } else {
+                // 外部スライサー等によるデータ変化：選択状態をクリア
                 this.selectedOrigIdx.clear();
                 this.selectedValues.clear();
             }
+            this.selfFilterApplied = false; // rowsChanged 時にだけリセット（早期リセット防止）
         }
-        this.selfFilterApplied = false;
 
         if (!this.filterPanel.querySelector(".value-input:focus")) {
             // ユーザーが操作済みかつ列構成が変わっていない場合は状態を上書きしない
@@ -327,6 +328,11 @@ export class Visual implements IVisual {
     private executeSearch(): void {
         this.appliedConditions = this.conditions.map(c => ({ ...c }));
         this.appliedLogic = this.logic;
+        // テキストフィルター変更時は選択状態をリセット（データセットフィルターとの矛盾防止）
+        this.selectedOrigIdx.clear();
+        this.selectedValues.clear();
+        this.selectionManager.clear();
+        this.host.applyJsonFilter(null, "general", "filter", FilterAction.remove);
         this.runFilter();
         this.renderTableHeader();
         this.scrollEl.scrollTop = 0;
@@ -336,6 +342,11 @@ export class Visual implements IVisual {
 
     private clearFilter(): void {
         this.appliedConditions = []; this.appliedLogic = "AND";
+        // フィルター解除時も選択をリセット
+        this.selectedOrigIdx.clear();
+        this.selectedValues.clear();
+        this.selectionManager.clear();
+        this.host.applyJsonFilter(null, "general", "filter", FilterAction.remove);
         this.runFilter();
         this.renderTableHeader();
         this.scrollEl.scrollTop = 0;
@@ -471,6 +482,7 @@ export class Visual implements IVisual {
     }
 
     private toggleSelectAll(): void {
+        if (this.filteredOrigIdx.length === 0) return;
         const allSel = this.filteredOrigIdx.every(i => this.selectedOrigIdx.has(i));
         this.filteredOrigIdx.forEach(i =>
             allSel ? this.selectedOrigIdx.delete(i) : this.selectedOrigIdx.add(i)
