@@ -183,7 +183,8 @@ export class Visual implements IVisual {
         } else if (!isSelfFilterUpdate) {
             this.selectedOrigIdx.clear();
         }
-        if (!isSelfFilterUpdate && !isAppend) {
+        // スクロールリセット: 初回ロードまたは外部フィルターでデータが変わった場合のみ
+        if (isFirstLoad) {
             this.scrollEl.scrollTop = 0;
         }
 
