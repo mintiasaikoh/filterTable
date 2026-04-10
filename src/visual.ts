@@ -2,7 +2,11 @@
 
 import powerbi from "powerbi-visuals-api";
 import { FormattingSettingsService } from "powerbi-visuals-utils-formattingmodel";
-import { BasicFilter, IFilterColumnTarget } from "powerbi-models";
+import {
+    BasicFilter, AdvancedFilter,
+    IFilterColumnTarget, IAdvancedFilterCondition,
+    AdvancedFilterLogicalOperators, AdvancedFilterConditionOperators,
+} from "powerbi-models";
 import "./../style/visual.less";
 
 import VisualConstructorOptions = powerbi.extensibility.visual.VisualConstructorOptions;
@@ -64,6 +68,11 @@ export class Visual implements IVisual {
     private selfFilterApplied = false; // applyJsonFilter 後の update で選択クリアを防ぐ
     private hasAppliedFilter  = false; // applyJsonFilter(remove) の無駄撃ちを防ぐ
     private prevRowCount      = -1;    // データ変化検知用
+    private isLoadingMore     = false; // fetchMoreData 読み込み中フラグ
+    private hasMoreSegments   = false; // PBI 側にまだ未取得データがあるか
+    private loadAllRequested  = false; // ユーザーが全件読み込みを要求したか
+    private needsFullData     = false; // 現在の検索が in-memory フォールバックを必要としているか
+    private readonly AUTO_LOAD_LIMIT = 100000; // 自動読み込みの上限行数
     private persistTimer: number | null = null;
     private scrollRaf:    number | null = null;
 
@@ -131,7 +140,17 @@ export class Visual implements IVisual {
         this.lastDataView = dv;
         this.tableData = this.extractTableData(dv);
 
-        // 列数が変わったらタブをリセット
+        // fetchMoreData: 自動では AUTO_LOAD_LIMIT まで、それ以降はユーザー要求時のみ
+        this.hasMoreSegments = !!(dv?.metadata?.segment);
+        const shouldFetch = this.hasMoreSegments
+            && (this.tableData.rows.length < this.AUTO_LOAD_LIMIT || this.loadAllRequested);
+        if (shouldFetch && this.host.fetchMoreData(true)) {
+            this.isLoadingMore = true;
+        } else {
+            this.isLoadingMore = false;
+            if (!this.hasMoreSegments) this.loadAllRequested = false;
+        }
+
         const colsChanged = this.tableData.columns.length !== this.colCount;
         this.colCount = this.tableData.columns.length;
         if (colsChanged) {
@@ -140,11 +159,10 @@ export class Visual implements IVisual {
             this.selectedValues.clear();
         }
 
-        // 行数が変わったとき：スクロールリセット＋選択クリア
         const rowCount = this.tableData.rows.length;
         const rowsChanged = rowCount !== this.prevRowCount;
         this.prevRowCount = rowCount;
-        if (rowsChanged) {
+        if (rowsChanged && !this.isLoadingMore) {
             this.scrollEl.scrollTop = 0;
             if (this.selfFilterApplied) {
                 this.rebuildSelectionFromValues();
@@ -156,7 +174,6 @@ export class Visual implements IVisual {
         }
 
         if (!this.filterPanel.querySelector(".value-input:focus")) {
-            // ユーザーが操作済みかつ列構成が変わっていない場合は状態を上書きしない
             if (!this.hasInteracted || colsChanged) this.restoreState(dv);
             this.renderFilterPanel();
         }
@@ -206,7 +223,7 @@ export class Visual implements IVisual {
         for (const v of ["AND", "OR"] as const) {
             const b = this.el("button", "logic-btn" + (this.logic === v ? " active" : ""));
             b.textContent = v;
-            b.onclick = () => { this.logic = v; this.saveState(); this.renderFilterPanel(); };
+            b.onclick = () => { this.logic = v; this.persist(); this.renderFilterPanel(); };
             tog.appendChild(b);
         }
         hdr.appendChild(tog);
@@ -222,7 +239,7 @@ export class Visual implements IVisual {
         addBtn.textContent = "+ 条件を追加";
         addBtn.onclick = () => {
             this.conditions.push({ columnIndex: 0, operator: "contains", value: "" });
-            this.saveState(); this.renderFilterPanel();
+            this.persist(); this.renderFilterPanel();
         };
 
         const clearBtn = this.el("button", "clear-btn") as HTMLButtonElement;
@@ -248,7 +265,7 @@ export class Visual implements IVisual {
             if (i === cond.columnIndex) o.selected = true;
             colSel.appendChild(o);
         });
-        colSel.onchange = () => { this.conditions[idx].columnIndex = +colSel.value; this.saveState(); };
+        colSel.onchange = () => { this.conditions[idx].columnIndex = +colSel.value; this.persist(); };
 
         const opSel = this.el("select", "op-select");
         for (const { v, l } of [{ v: "contains", l: "を含む" }, { v: "notContains", l: "を含まない" }]) {
@@ -258,7 +275,7 @@ export class Visual implements IVisual {
         }
         opSel.onchange = () => {
             this.conditions[idx].operator = opSel.value as "contains" | "notContains";
-            this.saveState();
+            this.persist();
         };
 
         const inp = this.el("input", "value-input") as HTMLInputElement;
@@ -267,7 +284,7 @@ export class Visual implements IVisual {
         inp.onkeydown = (e: KeyboardEvent) => { if (e.key === "Enter") this.executeSearch(); };
 
         const del = this.el("button", "remove-btn"); del.textContent = "×";
-        del.onclick = () => { this.conditions.splice(idx, 1); this.saveState(); this.renderFilterPanel(); };
+        del.onclick = () => { this.conditions.splice(idx, 1); this.persist(); this.renderFilterPanel(); };
 
         row.appendChild(colSel); row.appendChild(opSel); row.appendChild(inp); row.appendChild(del);
         return row;
@@ -282,7 +299,6 @@ export class Visual implements IVisual {
         this.colToggleBar.style.display = multi ? "flex" : "none";
         if (!multi) return;
 
-        // 「全列」チップ
         const allChip = this.el("button", "col-chip" + (this.activeColTab === -1 ? " active" : ""));
         allChip.textContent = "全列";
         allChip.onclick = () => {
@@ -293,7 +309,6 @@ export class Visual implements IVisual {
         };
         this.colToggleBar.appendChild(allChip);
 
-        // 各列チップ（クリックでその列だけ表示）
         this.tableData.columns.forEach((col, i) => {
             const chip = this.el("button", "col-chip" + (this.activeColTab === i ? " active" : ""));
             chip.textContent = col;
@@ -317,47 +332,119 @@ export class Visual implements IVisual {
     private executeSearch(): void {
         this.appliedConditions = this.conditions.map(c => ({ ...c }));
         this.appliedLogic = this.logic;
+        this.commitFilter();
+    }
+
+    private clearFilter(): void {
+        this.appliedConditions = []; this.appliedLogic = "AND";
+        this.commitFilter();
+    }
+
+    private commitFilter(): void {
         this.selectedOrigIdx.clear();
         this.selectedValues.clear();
-        if (this.hasAppliedFilter) {
-            this.host.applyJsonFilter(null, "general", "filter", FilterAction.remove);
-            this.hasAppliedFilter = false;
-        }
+        this.needsFullData = this.applySearchFilter();
         this.runFilter();
+
+        // in-memoryフォールバック + 未取得データあり → 全件読み込みしないと正確な結果にならない
+        if (this.needsFullData && this.hasMoreSegments) {
+            this.loadAllRequested = true;
+            this.host.fetchMoreData(true);
+            this.isLoadingMore = true;
+        }
+
         this.renderTableHeader();
         this.scrollEl.scrollTop = 0;
         this.renderVirtualRows();
         this.persist(); this.renderFilterPanel(); this.renderStatus();
     }
 
-    private clearFilter(): void {
-        this.appliedConditions = []; this.appliedLogic = "AND";
-        this.selectedOrigIdx.clear();
-        this.selectedValues.clear();
-        if (this.hasAppliedFilter) {
-            this.host.applyJsonFilter(null, "general", "filter", FilterAction.remove);
-            this.hasAppliedFilter = false;
+    // PBI クエリエンジンに検索条件を渡す（100k 件超のデータでも全件検索可能にする）
+    // 戻り値: in-memory フォールバックが必要（= PBI フィルターで表現しきれない）場合 true
+    private applySearchFilter(): boolean {
+        const active = this.appliedConditions.filter(c => c.value.trim() !== "");
+
+        if (active.length === 0) {
+            this.removeFilter();
+            return false;
         }
-        this.runFilter();
-        this.renderTableHeader();
-        this.scrollEl.scrollTop = 0;
-        this.renderVirtualRows();
-        this.persist(); this.renderFilterPanel(); this.renderStatus();
+
+        const dv = this.lastDataView;
+        if (!dv?.table?.columns?.length) return false;
+
+        const byCol = new Map<number, FilterCondition[]>();
+        active.forEach(c => {
+            if (!byCol.has(c.columnIndex)) byCol.set(c.columnIndex, []);
+            byCol.get(c.columnIndex)!.push(c);
+        });
+
+        // OR かつ複数列は PBI フィルターで表現不可 → in-memory のみ
+        if (byCol.size > 1 && this.appliedLogic === "OR") {
+            this.removeFilter();
+            return true;
+        }
+
+        const mapOp = (op: "contains" | "notContains"): AdvancedFilterConditionOperators =>
+            op === "contains" ? "Contains" : "DoesNotContain";
+
+        const filters: object[] = [];
+
+        byCol.forEach((conds, colIdx) => {
+            const target = this.buildFilterTarget(dv.table.columns[colIdx]);
+            if (!target) return;
+
+            // AdvancedFilter は 1 回の呼び出しで最大 2 条件しか受け付けない。
+            // 3 件以上は PBI 側で先頭 2 件を絞り、in-memory runFilter() が残りを絞る。
+            const logic: AdvancedFilterLogicalOperators = this.appliedLogic === "OR" ? "Or" : "And";
+            const c0: IAdvancedFilterCondition = { operator: mapOp(conds[0].operator), value: conds[0].value };
+            filters.push(
+                conds.length === 1
+                    ? new AdvancedFilter(target, "And", c0).toJSON()
+                    : new AdvancedFilter(
+                        target, logic, c0,
+                        { operator: mapOp(conds[1].operator), value: conds[1].value },
+                    ).toJSON(),
+            );
+        });
+
+        if (filters.length === 0) return false;
+
+        this.selfFilterApplied = true;
+        this.hasAppliedFilter  = true;
+        this.host.applyJsonFilter(
+            filters.length === 1 ? filters[0] : filters,
+            "general", "filter", FilterAction.merge,
+        );
+
+        // 同一列に3条件以上 → PBI は先頭2件のみ、残りは in-memory
+        const needsInMemory = Array.from(byCol.values()).some(conds => conds.length > 2);
+        return needsInMemory;
     }
 
     private runFilter(): void {
         const active = this.appliedConditions.filter(c => c.value.trim() !== "");
         this.filteredRows = []; this.filteredOrigIdx = [];
+
+        if (active.length === 0) {
+            this.filteredRows    = this.tableData.rows.slice();
+            this.filteredOrigIdx = this.tableData.rows.map((_, i) => i);
+            return;
+        }
+
+        // キーワードを事前に小文字化して行ごとの toLowerCase を省く
+        const keywords = active.map(c => c.value.toLowerCase());
+        const isAnd    = this.appliedLogic === "AND";
+
         this.tableData.rows.forEach((row, oi) => {
-            if (!active.length) { this.filteredRows.push(row); this.filteredOrigIdx.push(oi); return; }
-            const res = active.map(c => {
-                const cell = (row[c.columnIndex] ?? "").toLowerCase();
-                const kw   = c.value.toLowerCase();
-                return c.operator === "contains" ? cell.includes(kw) : !cell.includes(kw);
-            });
-            if (this.appliedLogic === "AND" ? res.every(Boolean) : res.some(Boolean)) {
-                this.filteredRows.push(row); this.filteredOrigIdx.push(oi);
+            // AND: 最初の false で即 fail、OR: 最初の true で即 pass（短絡評価）
+            let pass = isAnd;
+            for (let k = 0; k < active.length; k++) {
+                const c     = active[k];
+                const match = (row[c.columnIndex] ?? "").toLowerCase().includes(keywords[k])
+                    === (c.operator === "contains");
+                if (match !== isAnd) { pass = match; break; }
             }
+            if (pass) { this.filteredRows.push(row); this.filteredOrigIdx.push(oi); }
         });
     }
 
@@ -369,14 +456,12 @@ export class Visual implements IVisual {
         this.clear(this.thead);
         if (!this.tableData.columns.length) return;
 
-        // colgroup（チェックボックス列 + データ列）
         const cbCol = this.el("col", ""); cbCol.style.width = "32px";
         this.colGroup.appendChild(cbCol);
         this.tableData.columns.forEach((_, i) => {
             if (this.isColVisible(i)) this.colGroup.appendChild(this.el("col", ""));
         });
 
-        // thead 行
         const tr = this.el("tr", "");
 
         const cbTh = this.el("th", "cb-col");
@@ -488,22 +573,17 @@ export class Visual implements IVisual {
     }
 
     private commitSelection(): void {
-        // applyJsonFilter でデータセットレベルフィルター（スライサー同期 + 同ページクロスフィルター）
-        // selectionManager は使わない（呼ぶと update() が余分にトリガーされ 2倍重くなる）
         this.applyDatasetFilter();
         this.updateSelectionUI();
         this.renderStatus();
     }
 
-    // 選択値でデータセットフィルターを適用（スライサーの同期パネル対応）
     private applyDatasetFilter(): void {
         const dv = this.lastDataView;
-
-        // フィルターキー列：アクティブなタブ列、なければ先頭列
         const colIdx = this.activeColTab >= 0 ? this.activeColTab : 0;
 
-        // selectedValues は早期 return の前に必ず selectedOrigIdx から再構築する
-        // （early return 時に selectedValues が stale になると rebuildSelectionFromValues が誤動作する）
+        // selectedValues は early return の前に必ず再構築する
+        // （stale になると rebuildSelectionFromValues が誤動作する）
         this.selectedValues.clear();
         if (dv?.table?.columns?.length) {
             this.selectedOrigIdx.forEach(i => {
@@ -514,36 +594,35 @@ export class Visual implements IVisual {
 
         if (!dv?.table?.columns?.length) return;
 
-        const col = dv.table.columns[colIdx];
-
-        // queryName が "テーブル名.列名" 形式かバリデーション
-        const dotIdx = col?.queryName?.indexOf(".");
-        if (!col?.queryName || dotIdx === undefined || dotIdx < 1) {
-            // queryName が無効な場合はフィルター適用不可（selectedValues のみ更新して終了）
-            return;
-        }
+        const target = this.buildFilterTarget(dv.table.columns[colIdx]);
+        if (!target) return;
 
         if (this.selectedValues.size === 0) {
-            if (this.hasAppliedFilter) {
-                this.host.applyJsonFilter(null, "general", "filter", FilterAction.remove);
-                this.hasAppliedFilter = false;
-            }
+            this.removeFilter();
             return;
         }
 
-        const target: IFilterColumnTarget = {
-            table:  col.queryName.substring(0, dotIdx),
-            column: col.queryName.substring(dotIdx + 1) || col.displayName,
-        };
-        const values = Array.from(this.selectedValues);
-        const filter = new BasicFilter(target, "In", values);
-
+        const filter = new BasicFilter(target, "In", Array.from(this.selectedValues));
         this.selfFilterApplied = true;
         this.hasAppliedFilter  = true;
         this.host.applyJsonFilter(filter.toJSON(), "general", "filter", FilterAction.merge);
     }
 
-    // フィルター後に新しいデータで選択インデックスを再マップ
+    private buildFilterTarget(col: powerbi.DataViewMetadataColumn): IFilterColumnTarget | null {
+        const dotIdx = col?.queryName?.indexOf(".");
+        if (!col?.queryName || dotIdx === undefined || dotIdx < 1) return null;
+        return {
+            table:  col.queryName.substring(0, dotIdx),
+            column: col.queryName.substring(dotIdx + 1) || col.displayName,
+        };
+    }
+
+    private removeFilter(): void {
+        if (!this.hasAppliedFilter) return;
+        this.host.applyJsonFilter(null, "general", "filter", FilterAction.remove);
+        this.hasAppliedFilter = false;
+    }
+
     private rebuildSelectionFromValues(): void {
         if (this.selectedValues.size === 0) { this.selectedOrigIdx.clear(); return; }
         const colIdx = this.activeColTab >= 0 ? this.activeColTab : 0;
@@ -553,7 +632,6 @@ export class Visual implements IVisual {
         });
     }
 
-    // 選択変更時：全行再生成せず、可視行のチェックボックスだけ更新
     private updateSelectionUI(): void {
         this.tbody.querySelectorAll("tr[data-ri]").forEach((el: Element) => {
             const ri  = parseInt((el as HTMLElement).dataset.ri, 10);
@@ -578,7 +656,14 @@ export class Visual implements IVisual {
     private renderStatus(): void {
         this.clear(this.statusBar);
         const f = this.filteredRows.length, t = this.tableData.rows.length;
-        this.statusBar.appendChild(document.createTextNode(f === t ? `${t} 件` : `${f} / ${t} 件`));
+        const countText = f === t ? `${t} 件` : `${f} / ${t} 件`;
+
+        if (this.isLoadingMore) {
+            this.statusBar.appendChild(document.createTextNode(`${countText}（全件読み込み中…）`));
+        } else {
+            this.statusBar.appendChild(document.createTextNode(countText));
+        }
+
         if (this.selectedOrigIdx.size > 0) {
             const info = this.el("span", "sel-info");
             info.textContent = `　${this.selectedOrigIdx.size} 件選択中`;
@@ -590,11 +675,10 @@ export class Visual implements IVisual {
         }
     }
 
+
     // ==========================================================
     // Persist
     // ==========================================================
-    private saveState(): void { this.persist(); }
-
     private debounceSave(): void {
         if (this.persistTimer !== null) clearTimeout(this.persistTimer);
         this.persistTimer = window.setTimeout(() => { this.persistTimer = null; this.persist(); }, 800);
