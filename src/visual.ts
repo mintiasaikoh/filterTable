@@ -161,8 +161,8 @@ export class Visual implements IVisual {
             this.selectedValues.clear();
         }
 
-        // 同期フィルター復元: 自分が適用したのでなければ jsonFilters から UI を復元
-        if (!this.selfFilterApplied && !this.hasInteracted) {
+        // 同期フィルター復元: 自分が適用した直後でなければ jsonFilters から UI を復元
+        if (!this.selfFilterApplied) {
             this.restoreFromJsonFilters(options.jsonFilters);
         }
 
@@ -211,6 +211,16 @@ export class Visual implements IVisual {
         try   { this.appliedConditions = sanitize(m?.["applied"] ? JSON.parse(m["applied"] as string) : []); }
         catch { this.appliedConditions = []; }
         this.appliedLogic = (m?.["appliedLogic"] as string) === "OR" ? "OR" : "AND";
+
+        // 選択値の復元
+        try {
+            const selStr = m?.["selection"] as string;
+            const selArr: string[] = selStr ? JSON.parse(selStr) : [];
+            if (selArr.length > 0) {
+                this.selectedValues = new Set(selArr);
+                this.hasAppliedFilter = true;
+            }
+        } catch { /* 復元失敗時は空のまま */ }
     }
 
     // スライサー同期: 他ページから同期されたフィルターを読み取って UI に反映
@@ -228,8 +238,8 @@ export class Visual implements IVisual {
                     this.selectedValues = new Set(bf.values.map(String));
                     this.hasAppliedFilter = true;
                 }
-            } else if (ft === FilterType.Advanced) {
-                // AdvancedFilter（検索）の復元
+            } else if (ft === FilterType.Advanced && !this.hasInteracted) {
+                // AdvancedFilter（検索）の復元（操作中でなければ）
                 const af = raw as unknown as IAdvancedFilter;
                 if (!af.conditions?.length) continue;
                 const target = af.target as IFilterColumnTarget | undefined;
@@ -638,6 +648,7 @@ export class Visual implements IVisual {
         this.applyDatasetFilter();
         this.updateSelectionUI();
         this.renderStatus();
+        this.persist();
     }
 
     private applyDatasetFilter(): void {
@@ -749,9 +760,12 @@ export class Visual implements IVisual {
     private persist(): void {
         this.skipRender = true;
         this.hasInteracted = true;
+        const selArr = this.selectedValues.size > 0 ? Array.from(this.selectedValues) : [];
+        const selCol = this.activeColTab >= 0 ? this.activeColTab : 0;
         this.host.persistProperties({ merge: [{ objectName: "filterState", selector: null, properties: {
             conditions: JSON.stringify(this.conditions), logic: this.logic,
             applied: JSON.stringify(this.appliedConditions), appliedLogic: this.appliedLogic,
+            selection: JSON.stringify(selArr), selectionCol: selCol,
         }}]});
     }
 
