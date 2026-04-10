@@ -5,6 +5,7 @@ import { FormattingSettingsService } from "powerbi-visuals-utils-formattingmodel
 import {
     BasicFilter, AdvancedFilter,
     IFilterColumnTarget, IAdvancedFilterCondition,
+    IBasicFilter, IAdvancedFilter, FilterType,
     AdvancedFilterLogicalOperators, AdvancedFilterConditionOperators,
 } from "powerbi-models";
 import "./../style/visual.less";
@@ -160,12 +161,16 @@ export class Visual implements IVisual {
             this.selectedValues.clear();
         }
 
+        // 同期フィルター復元: 自分が適用したのでなければ jsonFilters から UI を復元
+        if (!this.selfFilterApplied && !this.hasInteracted) {
+            this.restoreFromJsonFilters(options.jsonFilters);
+        }
+
         const rowCount = this.tableData.rows.length;
         const rowsChanged = rowCount !== this.prevRowCount;
         this.prevRowCount = rowCount;
         if (rowsChanged) {
             if (this.isLoadingMore) {
-                // fetchMoreData 中: 選択を維持したまま再フィルター
                 this.runFilter();
                 this.renderTableHeader();
                 this.renderVirtualRows();
@@ -175,9 +180,10 @@ export class Visual implements IVisual {
             this.scrollEl.scrollTop = 0;
             if (this.selfFilterApplied) {
                 this.rebuildSelectionFromValues();
+            } else if (this.selectedValues.size > 0) {
+                this.rebuildSelectionFromValues();
             } else {
                 this.selectedOrigIdx.clear();
-                this.selectedValues.clear();
             }
             this.selfFilterApplied = false;
         }
@@ -205,6 +211,53 @@ export class Visual implements IVisual {
         try   { this.appliedConditions = sanitize(m?.["applied"] ? JSON.parse(m["applied"] as string) : []); }
         catch { this.appliedConditions = []; }
         this.appliedLogic = (m?.["appliedLogic"] as string) === "OR" ? "OR" : "AND";
+    }
+
+    // スライサー同期: 他ページから同期されたフィルターを読み取って UI に反映
+    private restoreFromJsonFilters(jsonFilters: powerbi.IFilter[] | undefined): void {
+        if (!jsonFilters?.length || !this.tableData.columns.length) return;
+
+        for (const f of jsonFilters) {
+            const raw = f as unknown as Record<string, unknown>;
+            const ft = raw.filterType as number | undefined;
+
+            if (ft === FilterType.Basic) {
+                // BasicFilter（選択）の復元
+                const bf = raw as unknown as IBasicFilter;
+                if (bf.operator === "In" && Array.isArray(bf.values)) {
+                    this.selectedValues = new Set(bf.values.map(String));
+                    this.hasAppliedFilter = true;
+                }
+            } else if (ft === FilterType.Advanced) {
+                // AdvancedFilter（検索）の復元
+                const af = raw as unknown as IAdvancedFilter;
+                if (!af.conditions?.length) continue;
+                const target = af.target as IFilterColumnTarget | undefined;
+                if (!target?.column) continue;
+
+                let colIdx = this.tableData.columns.findIndex(c => c === target.column);
+                if (colIdx < 0) {
+                    colIdx = this.tableData.columns.findIndex((_, i) =>
+                        this.lastDataView?.table?.columns?.[i]?.queryName?.endsWith("." + target.column));
+                }
+                if (colIdx < 0) continue;
+
+                const mapOp = (op: string): "contains" | "notContains" =>
+                    op === "DoesNotContain" ? "notContains" : "contains";
+
+                const restored: FilterCondition[] = af.conditions.map(c => ({
+                    columnIndex: colIdx,
+                    operator: mapOp(c.operator as string),
+                    value: String(c.value ?? ""),
+                }));
+
+                this.appliedConditions = restored;
+                this.conditions = restored.map(c => ({ ...c }));
+                this.appliedLogic = af.logicalOperator === "Or" ? "OR" : "AND";
+                this.logic = this.appliedLogic;
+                this.hasAppliedFilter = true;
+            }
+        }
     }
 
     private extractTableData(dv: DataView): TableData {
