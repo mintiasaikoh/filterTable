@@ -7,6 +7,13 @@
         }
     ],
     "objects": {
+        "general": {
+            "properties": {
+                "filter": {
+                    "type": { "filter": true }
+                }
+            }
+        },
         "filterState": {
             "properties": {
                 "conditions": {
