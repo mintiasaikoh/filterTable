@@ -16,6 +16,8 @@ import IVisual                  = powerbi.extensibility.visual.IVisual;
 import IVisualHost              = powerbi.extensibility.visual.IVisualHost;
 import DataView                 = powerbi.DataView;
 import FilterAction             = powerbi.FilterAction;
+import VisualUpdateType         = powerbi.VisualUpdateType;
+import VisualDataChangeOperationKind = powerbi.VisualDataChangeOperationKind;
 
 import { VisualFormattingSettingsModel } from "./settings";
 
@@ -64,15 +66,12 @@ export class Visual implements IVisual {
     private tbody:        HTMLTableSectionElement;
 
     // ---- 制御フラグ ----
-    private skipRender        = false;
     private hasInteracted     = false;
-    private selfFilterApplied = false; // applyJsonFilter 後の update で選択クリアを防ぐ
     private hasAppliedFilter  = false; // applyJsonFilter(remove) の無駄撃ちを防ぐ
-    private prevRowCount      = -1;    // データ変化検知用
     private isLoadingMore     = false; // fetchMoreData 読み込み中フラグ
-    private hasMoreSegments   = false; // PBI 側にまだ未取得データがあるか
     private loadAllRequested  = false; // ユーザーが全件読み込みを要求したか
     private needsFullData     = false; // 現在の検索が in-memory フォールバックを必要としているか
+    private lastFilterJson    = "";    // 自分が適用したフィルターの JSON（自己 update 判定用）
     private persistTimer: number | null = null;
     private scrollRaf:    number | null = null;
 
@@ -122,30 +121,48 @@ export class Visual implements IVisual {
     }
 
     // ==========================================================
-    // update
+    // update — VisualUpdateType で分岐し、不要な再描画を抑制
     // ==========================================================
     public update(options: VisualUpdateOptions): void {
         this.formattingSettings = this.formattingSettingsService
             .populateFormattingSettingsModel(VisualFormattingSettingsModel, options.dataViews?.[0]);
 
-        const dv: DataView = options.dataViews?.[0];
-
-        // persist() による update はスキップ（入力フォーカス保護）
-        if (this.skipRender) {
-            this.skipRender = false;
+        // リサイズのみの場合はスクロール再描画だけで済む
+        if (options.type === VisualUpdateType.Resize
+            || options.type === (VisualUpdateType.Resize | VisualUpdateType.ResizeEnd)) {
+            this.renderVirtualRows();
             return;
         }
 
+        // データ変更を含まない場合は何もしない（Style, ViewMode 等）
+        if (!(options.type & VisualUpdateType.Data)) return;
+
+        const dv: DataView = options.dataViews?.[0];
         this.lastDataView = dv;
         this.tableData = this.extractTableData(dv);
 
-        // --- fetchMoreData ---
-        this.hasMoreSegments = !!(dv?.metadata?.segment);
-        if (this.hasMoreSegments && this.loadAllRequested && this.host.fetchMoreData(true)) {
+        // --- 自分が適用したフィルターの応答か判定 ---
+        const currentFilterJson = JSON.stringify(options.jsonFilters ?? []);
+        const isSelfFilterUpdate = this.lastFilterJson !== ""
+            && currentFilterJson === this.lastFilterJson;
+        if (isSelfFilterUpdate) this.lastFilterJson = "";
+
+        // --- fetchMoreData（Append/Segment）---
+        const isAppend = options.operationKind === VisualDataChangeOperationKind.Append;
+        const hasMoreSegments = !!(dv?.metadata?.segment);
+        if (hasMoreSegments && this.loadAllRequested && this.host.fetchMoreData(true)) {
             this.isLoadingMore = true;
         } else {
             this.isLoadingMore = false;
-            if (!this.hasMoreSegments) this.loadAllRequested = false;
+            if (!hasMoreSegments) this.loadAllRequested = false;
+        }
+
+        // fetchMoreData 中の中間 update: テーブルだけ更新して返る
+        if (isAppend && this.isLoadingMore) {
+            this.runFilter();
+            this.renderVirtualRows();
+            this.renderStatus();
+            return;
         }
 
         // --- 列変化検知 ---
@@ -154,39 +171,21 @@ export class Visual implements IVisual {
         if (colsChanged) this.activeColTab = -1;
 
         // --- 状態復元（初回 or 列構成変化時のみ）---
-        // 順序: persist → jsonFilters（jsonFilters が persist の空データを上書きできる）
         const isFirstLoad = !this.hasInteracted;
         if (isFirstLoad || colsChanged) {
             this.restoreState(dv);
             this.restoreFromJsonFilters(options.jsonFilters);
         }
 
-        // --- 行数変化時の選択処理 ---
-        const rowCount = this.tableData.rows.length;
-        const rowsChanged = rowCount !== this.prevRowCount;
-        this.prevRowCount = rowCount;
-
-        if (rowsChanged && this.isLoadingMore) {
-            this.runFilter();
-            this.renderTableHeader();
-            this.renderVirtualRows();
-            this.renderStatus();
-            this.selfFilterApplied = false;
-            return;
+        // --- 選択インデックスの再構築 ---
+        if (isSelfFilterUpdate || this.selectedValues.size > 0) {
+            this.rebuildSelectionFromValues();
+        } else if (!isSelfFilterUpdate) {
+            this.selectedOrigIdx.clear();
         }
-
-        // 選択インデックスの再構築が必要なケース:
-        // - rowsChanged: データが変わったので行インデックスが変わった
-        // - isFirstLoad: 初回ロード（restoreState/jsonFilters から selectedValues を復元済み）
-        if (rowsChanged || isFirstLoad) {
-            if (rowsChanged) this.scrollEl.scrollTop = 0;
-            if (this.selfFilterApplied || this.selectedValues.size > 0) {
-                this.rebuildSelectionFromValues();
-            } else {
-                this.selectedOrigIdx.clear();
-            }
+        if (!isSelfFilterUpdate && !isAppend) {
+            this.scrollEl.scrollTop = 0;
         }
-        this.selfFilterApplied = false;
 
         // --- レンダリング ---
         if (!this.filterPanel.querySelector(".value-input:focus")) {
@@ -414,15 +413,11 @@ export class Visual implements IVisual {
     private commitFilter(): void {
         this.selectedOrigIdx.clear();
         this.selectedValues.clear();
-
-        // persist を先に呼ぶ（skipRender=true）。
-        // 直後の applyJsonFilter が update を発火するが、その update は
-        // selfFilterApplied で正しく処理される（skipRender は persist の update を消化する）。
-        this.persist();
         this.needsFullData = this.applySearchFilter();
         this.runFilter();
 
-        if (this.needsFullData && this.hasMoreSegments) {
+        const hasMoreSegments = !!(this.lastDataView?.metadata?.segment);
+        if (this.needsFullData && hasMoreSegments) {
             this.loadAllRequested = true;
             this.host.fetchMoreData(true);
             this.isLoadingMore = true;
@@ -433,6 +428,7 @@ export class Visual implements IVisual {
         this.renderVirtualRows();
         this.renderFilterPanel();
         this.renderStatus();
+        this.persist();
     }
 
     // PBI クエリエンジンに検索条件を渡す（100k 件超のデータでも全件検索可能にする）
@@ -485,12 +481,10 @@ export class Visual implements IVisual {
 
         if (filters.length === 0) return false;
 
-        this.selfFilterApplied = true;
-        this.hasAppliedFilter  = true;
-        this.host.applyJsonFilter(
-            filters.length === 1 ? filters[0] : filters,
-            "general", "filter", FilterAction.merge,
-        );
+        this.hasAppliedFilter = true;
+        const filterPayload = filters.length === 1 ? filters[0] : filters;
+        this.lastFilterJson = JSON.stringify([filterPayload]);
+        this.host.applyJsonFilter(filterPayload, "general", "filter", FilterAction.merge);
 
         // 同一列に3条件以上 → PBI は先頭2件のみ、残りは in-memory
         const needsInMemory = Array.from(byCol.values()).some(conds => conds.length > 2);
@@ -649,11 +643,10 @@ export class Visual implements IVisual {
     }
 
     private commitSelection(): void {
-        // persist を先に（skipRender 消化用）、applyJsonFilter を後に
-        this.persist();
         this.applyDatasetFilter();
         this.updateSelectionUI();
         this.renderStatus();
+        this.persist();
     }
 
     private applyDatasetFilter(): void {
@@ -681,9 +674,10 @@ export class Visual implements IVisual {
         }
 
         const filter = new BasicFilter(target, "In", Array.from(this.selectedValues));
-        this.selfFilterApplied = true;
-        this.hasAppliedFilter  = true;
-        this.host.applyJsonFilter(filter.toJSON(), "general", "filter", FilterAction.merge);
+        const filterJson = filter.toJSON();
+        this.hasAppliedFilter = true;
+        this.lastFilterJson = JSON.stringify([filterJson]);
+        this.host.applyJsonFilter(filterJson, "general", "filter", FilterAction.merge);
     }
 
     private buildFilterTarget(col: powerbi.DataViewMetadataColumn): IFilterColumnTarget | null {
@@ -763,7 +757,6 @@ export class Visual implements IVisual {
     }
 
     private persist(): void {
-        this.skipRender = true;
         this.hasInteracted = true;
         const selArr = this.selectedValues.size > 0 ? Array.from(this.selectedValues) : [];
         const selCol = this.activeColTab >= 0 ? this.activeColTab : 0;
