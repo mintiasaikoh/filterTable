@@ -33,7 +33,7 @@
             "table": {
                 "rows": {
                     "for": { "in": "values" },
-                    "dataReductionAlgorithm": { "window": { "count": 30000 } }
+                    "dataReductionAlgorithm": { "top": { "count": 100000 } }
                 }
             }
         }

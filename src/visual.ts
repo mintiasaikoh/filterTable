@@ -72,7 +72,6 @@ export class Visual implements IVisual {
     private hasMoreSegments   = false; // PBI 側にまだ未取得データがあるか
     private loadAllRequested  = false; // ユーザーが全件読み込みを要求したか
     private needsFullData     = false; // 現在の検索が in-memory フォールバックを必要としているか
-    private readonly AUTO_LOAD_LIMIT = 100000; // 自動読み込みの上限行数
     private persistTimer: number | null = null;
     private scrollRaf:    number | null = null;
 
@@ -140,12 +139,14 @@ export class Visual implements IVisual {
         this.lastDataView = dv;
         this.tableData = this.extractTableData(dv);
 
-        // fetchMoreData: 自動では AUTO_LOAD_LIMIT まで、それ以降はユーザー要求時のみ
+        // fetchMoreData: loadAllRequested 時のみ追加取得（通常は top:100k で一括）
         this.hasMoreSegments = !!(dv?.metadata?.segment);
-        const shouldFetch = this.hasMoreSegments
-            && (this.tableData.rows.length < this.AUTO_LOAD_LIMIT || this.loadAllRequested);
-        if (shouldFetch && this.host.fetchMoreData(true)) {
-            this.isLoadingMore = true;
+        if (this.hasMoreSegments && this.loadAllRequested) {
+            if (this.host.fetchMoreData(true)) {
+                this.isLoadingMore = true;
+            } else {
+                this.isLoadingMore = false;
+            }
         } else {
             this.isLoadingMore = false;
             if (!this.hasMoreSegments) this.loadAllRequested = false;
@@ -162,7 +163,15 @@ export class Visual implements IVisual {
         const rowCount = this.tableData.rows.length;
         const rowsChanged = rowCount !== this.prevRowCount;
         this.prevRowCount = rowCount;
-        if (rowsChanged && !this.isLoadingMore) {
+        if (rowsChanged) {
+            if (this.isLoadingMore) {
+                // fetchMoreData 中: 選択を維持したまま再フィルター
+                this.runFilter();
+                this.renderTableHeader();
+                this.renderVirtualRows();
+                this.renderStatus();
+                return;
+            }
             this.scrollEl.scrollTop = 0;
             if (this.selfFilterApplied) {
                 this.rebuildSelectionFromValues();
