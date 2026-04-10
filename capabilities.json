@@ -39,5 +39,6 @@
         }
     ],
     "supportsHighlight": true,
+    "supportsSynchronizingFilterState": true,
     "privileges": []
 }
