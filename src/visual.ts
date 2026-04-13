@@ -3,10 +3,9 @@
 import powerbi from "powerbi-visuals-api";
 import { FormattingSettingsService } from "powerbi-visuals-utils-formattingmodel";
 import {
-    BasicFilter, AdvancedFilter,
-    IFilterColumnTarget, IAdvancedFilterCondition,
+    BasicFilter,
+    IFilterColumnTarget,
     IBasicFilter, IAdvancedFilter, FilterType,
-    AdvancedFilterLogicalOperators, AdvancedFilterConditionOperators,
 } from "powerbi-models";
 import "./../style/visual.less";
 
@@ -73,12 +72,12 @@ export class Visual implements IVisual {
     private hasAppliedFilter  = false; // applyJsonFilter(remove) の無駄撃ちを防ぐ
     private isLoadingMore     = false; // fetchMoreData 読み込み中フラグ
     private loadAllRequested  = false; // ユーザーが全件読み込みを要求したか
-    private needsFullData     = false; // 現在の検索が in-memory フォールバックを必要としているか
     private lastFilterJson    = "";    // 自分が適用したフィルターの JSON（自己 update 判定用）
     private persistTimer: number | null = null;
     private scrollRaf:    number | null = null;
     private rootEl:       HTMLElement;
     private rowHeight     = ROW_H;
+    private colWidths: Map<number, number> = new Map(); // 列インデックス → px幅
 
     constructor(options: VisualConstructorOptions) {
         this.host = options.host;
@@ -166,9 +165,18 @@ export class Visual implements IVisual {
         // fetchMoreData 中の中間 update: テーブルだけ更新して返る
         if (isAppend && this.isLoadingMore) {
             this.runFilter();
+            // 検索中は追加データの結果も自動選択に含める
+            const hasActiveSearch = this.appliedConditions.some(c => c.value.trim() !== "");
+            if (hasActiveSearch) {
+                this.filteredOrigIdx.forEach(i => this.selectedOrigIdx.add(i));
+            }
             this.renderVirtualRows();
             this.renderStatus();
             return;
+        }
+        // fetchMoreData 完了後: 選択が蓄積されていれば BasicFilter を適用
+        if (!this.isLoadingMore && this.selectedOrigIdx.size > 0 && !isSelfFilterUpdate) {
+            this.applyDatasetFilter();
         }
 
         // --- 列変化検知 ---
@@ -422,21 +430,26 @@ export class Visual implements IVisual {
     private commitFilter(): void {
         this.selectedOrigIdx.clear();
         this.selectedValues.clear();
-        this.needsFullData = this.applySearchFilter();
+
         this.runFilter();
 
         const hasMoreSegments = !!(this.lastDataView?.metadata?.segment);
-        if (this.needsFullData && hasMoreSegments) {
+        const hasActiveSearch = this.appliedConditions.some(c => c.value.trim() !== "");
+
+        // 全件読み込みが必要な場合
+        if (hasActiveSearch && hasMoreSegments) {
             this.loadAllRequested = true;
             this.host.fetchMoreData(true);
             this.isLoadingMore = true;
         }
 
-        // 検索結果がある場合、全結果行を自動選択してクロスフィルター適用
-        const hasActiveSearch = this.appliedConditions.some(c => c.value.trim() !== "");
+        // 検索結果がある場合、全結果行を自動選択して BasicFilter でクロスフィルター適用
         if (hasActiveSearch && this.filteredRows.length > 0) {
             this.filteredOrigIdx.forEach(i => this.selectedOrigIdx.add(i));
             this.applyDatasetFilter();
+        } else {
+            // 検索解除時はフィルターも解除
+            this.removeFilter();
         }
 
         this.renderTableHeader();
@@ -448,65 +461,7 @@ export class Visual implements IVisual {
         requestAnimationFrame(() => this.persist());
     }
 
-    // PBI クエリエンジンに検索条件を渡す（100k 件超のデータでも全件検索可能にする）
-    // 戻り値: in-memory フォールバックが必要（= PBI フィルターで表現しきれない）場合 true
-    private applySearchFilter(): boolean {
-        const active = this.appliedConditions.filter(c => c.value.trim() !== "");
 
-        if (active.length === 0) {
-            this.removeFilter();
-            return false;
-        }
-
-        const dv = this.lastDataView;
-        if (!dv?.table?.columns?.length) return false;
-
-        const byCol = new Map<number, FilterCondition[]>();
-        active.forEach(c => {
-            if (!byCol.has(c.columnIndex)) byCol.set(c.columnIndex, []);
-            byCol.get(c.columnIndex)!.push(c);
-        });
-
-        // OR かつ複数列は PBI フィルターで表現不可 → in-memory のみ
-        if (byCol.size > 1 && this.appliedLogic === "OR") {
-            this.removeFilter();
-            return true;
-        }
-
-        const mapOp = (op: "contains" | "notContains"): AdvancedFilterConditionOperators =>
-            op === "contains" ? "Contains" : "DoesNotContain";
-
-        const filters: (BasicFilter | AdvancedFilter)[] = [];
-
-        byCol.forEach((conds, colIdx) => {
-            const target = this.buildFilterTarget(dv.table.columns[colIdx]);
-            if (!target) return;
-
-            // AdvancedFilter は 1 回の呼び出しで最大 2 条件しか受け付けない。
-            // 3 件以上は PBI 側で先頭 2 件を絞り、in-memory runFilter() が残りを絞る。
-            const logic: AdvancedFilterLogicalOperators = this.appliedLogic === "OR" ? "Or" : "And";
-            const c0: IAdvancedFilterCondition = { operator: mapOp(conds[0].operator), value: conds[0].value };
-            filters.push(
-                conds.length === 1
-                    ? new AdvancedFilter(target, "And", c0)
-                    : new AdvancedFilter(
-                        target, logic, c0,
-                        { operator: mapOp(conds[1].operator), value: conds[1].value },
-                    ),
-            );
-        });
-
-        if (filters.length === 0) return false;
-
-        this.hasAppliedFilter = true;
-        const filterPayload = filters.length === 1 ? filters[0] : filters;
-        this.lastFilterJson = JSON.stringify(filters.map(f => f.toJSON()));
-        this.host.applyJsonFilter(filterPayload, "general", "filter", FilterAction.merge);
-
-        // 同一列に3条件以上 → PBI は先頭2件のみ、残りは in-memory
-        const needsInMemory = Array.from(byCol.values()).some(conds => conds.length > 2);
-        return needsInMemory;
-    }
 
     private runFilter(): void {
         const active = this.appliedConditions.filter(c => c.value.trim() !== "");
@@ -546,7 +501,11 @@ export class Visual implements IVisual {
         const cbCol = this.el("col", ""); cbCol.style.width = "32px";
         this.colGroup.appendChild(cbCol);
         this.tableData.columns.forEach((_, i) => {
-            if (this.isColVisible(i)) this.colGroup.appendChild(this.el("col", ""));
+            if (!this.isColVisible(i)) return;
+            const col = this.el("col", "");
+            const w = this.colWidths.get(i);
+            if (w) col.style.width = w + "px";
+            this.colGroup.appendChild(col);
         });
 
         const tr = this.el("tr", "");
@@ -563,7 +522,14 @@ export class Visual implements IVisual {
 
         this.tableData.columns.forEach((col, i) => {
             if (!this.isColVisible(i)) return;
-            const th = this.el("th", ""); th.textContent = col;
+            const th = this.el("th", "");
+            th.textContent = col;
+
+            // リサイズハンドル
+            const handle = this.el("div", "col-resize-handle");
+            handle.addEventListener("mousedown", (e) => this.onColResizeStart(e, i));
+            th.appendChild(handle);
+
             tr.appendChild(th);
         });
         this.thead.appendChild(tr);
@@ -794,6 +760,43 @@ export class Visual implements IVisual {
 
 
     // ==========================================================
+    // 列幅リサイズ
+    // ==========================================================
+    private onColResizeStart(e: MouseEvent, colIdx: number): void {
+        e.preventDefault();
+        e.stopPropagation();
+        const startX = e.clientX;
+
+        // 現在の列幅を取得（col 要素から）
+        const cols = this.colGroup.querySelectorAll("col");
+        // cols[0] はチェックボックス列、表示列のインデックスを求める
+        let visIdx = 0;
+        for (let i = 0; i < this.tableData.columns.length; i++) {
+            if (!this.isColVisible(i)) continue;
+            if (i === colIdx) break;
+            visIdx++;
+        }
+        const colEl = cols[visIdx + 1] as HTMLElement; // +1 for cb col
+        const startW = colEl.offsetWidth || colEl.getBoundingClientRect().width || 80;
+
+        const onMove = (ev: MouseEvent) => {
+            const newW = Math.max(40, startW + ev.clientX - startX);
+            colEl.style.width = newW + "px";
+            this.colWidths.set(colIdx, newW);
+        };
+
+        const onUp = () => {
+            document.removeEventListener("mousemove", onMove);
+            document.removeEventListener("mouseup", onUp);
+            this.rootEl.classList.remove("col-resizing");
+        };
+
+        this.rootEl.classList.add("col-resizing");
+        document.addEventListener("mousemove", onMove);
+        document.addEventListener("mouseup", onUp);
+    }
+
+    // ==========================================================
     // 書式設定の適用
     // ==========================================================
     private applyTableStyles(): void {
@@ -812,7 +815,7 @@ export class Visual implements IVisual {
         s.setProperty("--val-bg", v.backgroundColor.value.value);
         s.setProperty("--val-alt-color", v.altFontColor.value.value);
         s.setProperty("--val-alt-bg", v.altBackgroundColor.value.value);
-        s.setProperty("--val-white-space", v.wordWrap.value ? "normal" : "nowrap");
+        s.setProperty("--val-white-space", v.wordWrap.value ? "pre-line" : "nowrap");
 
         // 行高さをフォントサイズに連動（pt→px換算 * 1.6 + padding）
         this.rowHeight = Math.max(ROW_H, Math.round(vSize * 1.333 * 1.6 + 4));

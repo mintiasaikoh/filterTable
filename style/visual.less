@@ -10,6 +10,11 @@
 
     * { box-sizing: border-box; }
 
+    &.col-resizing {
+        cursor: col-resize !important;
+        user-select: none;
+    }
+
     // ----- フィルターパネル -----
     .filter-panel {
         flex: 0 0 auto;
@@ -183,7 +188,19 @@
                     white-space: nowrap;
                     overflow: hidden;
                     text-overflow: ellipsis;
+                    position: relative;
                     &:not(:last-child) { border-right: 1px solid #e0e0e0; }
+
+                    .col-resize-handle {
+                        position: absolute;
+                        top: 0; right: -3px;
+                        width: 6px; height: 100%;
+                        cursor: col-resize;
+                        z-index: 2;
+                        &:hover, &:active {
+                            background: rgba(0, 120, 212, 0.3);
+                        }
+                    }
                 }
             }
 
