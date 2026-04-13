@@ -17,6 +17,7 @@ import DataView                 = powerbi.DataView;
 import FilterAction             = powerbi.FilterAction;
 import VisualUpdateType         = powerbi.VisualUpdateType;
 import VisualDataChangeOperationKind = powerbi.VisualDataChangeOperationKind;
+import DataViewTable               = powerbi.DataViewTable;
 
 import { VisualFormattingSettingsModel } from "./settings";
 
@@ -154,7 +155,6 @@ export class Visual implements IVisual {
 
         const dv: DataView = options.dataViews?.[0];
         this.lastDataView = dv;
-        this.tableData = this.extractTableData(dv);
 
         // --- 自分が適用したフィルターの応答か判定 ---
         const currentFilterJson = JSON.stringify(options.jsonFilters ?? []);
@@ -162,12 +162,23 @@ export class Visual implements IVisual {
             && currentFilterJson === this.lastFilterJson;
         if (isSelfFilterUpdate) this.lastFilterJson = "";
 
-        // --- fetchMoreData: 常に全件取得（window + aggregation モード）---
-        // 制限: window サイズ 2-30,000、合計 1,048,576行、メモリ 100MB
-        const isAppend = options.operationKind === VisualDataChangeOperationKind.Append;
+        // --- fetchMoreData: incremental mode で 100MB 制限を回避 ---
+        // incremental mode: fetchMoreData(false) → 各チャンクのデータのみ返る
+        // → 自前で蓄積するため PBI の dataView メモリ制限に引っかからない
+        const isSegment = options.operationKind === VisualDataChangeOperationKind.Segment
+            || options.operationKind === VisualDataChangeOperationKind.Append;
         const hasMoreSegments = !!(dv?.metadata?.segment);
+
+        if (isSegment && dv?.table) {
+            // インクリメンタルチャンク: 新しい行だけ追加
+            this.appendIncrementalData(dv.table);
+        } else {
+            // 初回ロード or フィルター変更: データ全体を置き換え
+            this.tableData = this.extractTableData(dv);
+        }
+
         if (hasMoreSegments) {
-            const accepted = this.host.fetchMoreData(true);
+            const accepted = this.host.fetchMoreData(false); // incremental mode
             this.isLoadingMore = accepted;
             if (!accepted) this.dataLimitReached = true;
         } else {
@@ -175,10 +186,9 @@ export class Visual implements IVisual {
             this.dataLimitReached = false;
         }
 
-        // fetchMoreData 中の中間 update: テーブルだけ更新して返る
-        if (isAppend && this.isLoadingMore) {
+        // 読み込み中の中間 update: テーブルだけ更新して返る
+        if (isSegment && this.isLoadingMore) {
             this.runFilter();
-            // 検索中は追加データの結果も自動選択に含める
             const hasActiveSearch = this.appliedConditions.some(c => c.value.trim() !== "");
             if (hasActiveSearch) {
                 this.filteredOrigIdx.forEach(i => this.selectedOrigIdx.add(i));
@@ -187,7 +197,7 @@ export class Visual implements IVisual {
             this.renderStatus();
             return;
         }
-        // fetchMoreData 完了後: 選択が蓄積されていれば BasicFilter を適用
+        // 読み込み完了後: 選択が蓄積されていれば BasicFilter を適用
         if (!this.isLoadingMore && this.selectedOrigIdx.size > 0 && !isSelfFilterUpdate) {
             this.applyDatasetFilter();
         }
@@ -306,6 +316,24 @@ export class Visual implements IVisual {
             rows:    dv.table.rows.map(r => r.map(c => (c == null) ? "" : String(c))),
             rawRows: dv.table.rows.map(r => r.map(c => (c == null) ? null : c as PrimitiveValue)),
         };
+    }
+
+    private appendIncrementalData(table: DataViewTable): void {
+        // incremental mode では前回チャンクとの重複がある場合がある
+        // lastMergeIndex で重複をスキップ
+        const offset = (table as unknown as Record<string, unknown>)["lastMergeIndex"] as number | undefined;
+        const startIdx = (offset === undefined) ? 0 : offset + 1;
+
+        // 列情報の更新（初回のみ意味がある）
+        if (this.tableData.columns.length === 0) {
+            this.tableData.columns = table.columns.map(c => c.displayName || "");
+        }
+
+        for (let i = startIdx; i < table.rows.length; i++) {
+            const r = table.rows[i];
+            this.tableData.rows.push(r.map(c => (c == null) ? "" : String(c)));
+            this.tableData.rawRows.push(r.map(c => (c == null) ? null : c as PrimitiveValue));
+        }
     }
 
     // ==========================================================
