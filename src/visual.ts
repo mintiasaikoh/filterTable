@@ -573,6 +573,7 @@ export class Visual implements IVisual {
                     this.sortColIdx = i;
                     this.sortDir = "asc";
                 }
+                this.lastClickedRi = -1; // ソート変更で行順が変わるのでリセット
                 this.runFilter();
                 this.renderTableHeader();
                 this.renderVirtualRows();
