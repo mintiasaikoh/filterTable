@@ -142,8 +142,15 @@ export class Visual implements IVisual {
             return;
         }
 
-        // データ変更を含まない場合は何もしない（Style, ViewMode 等）
-        if (!(options.type & VisualUpdateType.Data)) return;
+        // Style のみ → 書式設定だけ反映して返る
+        if (!(options.type & VisualUpdateType.Data)) {
+            if (options.type & VisualUpdateType.Style) {
+                this.applyTableStyles();
+                this.renderTableHeader();
+                this.renderVirtualRows();
+            }
+            return;
+        }
 
         const dv: DataView = options.dataViews?.[0];
         this.lastDataView = dv;
@@ -762,8 +769,13 @@ export class Visual implements IVisual {
         const filterValues = Array.from(rawValuesSet);
 
         const filter = new BasicFilter(target, "In", filterValues);
+        const filterJson = JSON.stringify([filter.toJSON()]);
+
+        // 前回と同一フィルターなら再適用しない（無限ループ防止）
+        if (filterJson === this.lastFilterJson) return;
+
         this.hasAppliedFilter = true;
-        this.lastFilterJson = JSON.stringify([filter.toJSON()]);
+        this.lastFilterJson = filterJson;
         this.host.applyJsonFilter(filter, "general", "filter", FilterAction.merge);
     }
 
