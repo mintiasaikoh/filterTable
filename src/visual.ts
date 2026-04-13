@@ -71,7 +71,6 @@ export class Visual implements IVisual {
     private hasInteracted     = false;
     private hasAppliedFilter  = false; // applyJsonFilter(remove) の無駄撃ちを防ぐ
     private isLoadingMore     = false; // fetchMoreData 読み込み中フラグ
-    private loadAllRequested  = false; // ユーザーが全件読み込みを要求したか
     private lastFilterJson    = "";    // 自分が適用したフィルターの JSON（自己 update 判定用）
     private persistTimer: number | null = null;
     private scrollRaf:    number | null = null;
@@ -162,14 +161,14 @@ export class Visual implements IVisual {
             && currentFilterJson === this.lastFilterJson;
         if (isSelfFilterUpdate) this.lastFilterJson = "";
 
-        // --- fetchMoreData（Append/Segment）---
+        // --- fetchMoreData: 常に全件取得 ---
         const isAppend = options.operationKind === VisualDataChangeOperationKind.Append;
         const hasMoreSegments = !!(dv?.metadata?.segment);
-        if (hasMoreSegments && this.loadAllRequested && this.host.fetchMoreData(true)) {
+        if (hasMoreSegments) {
+            this.host.fetchMoreData(true);
             this.isLoadingMore = true;
         } else {
             this.isLoadingMore = false;
-            if (!hasMoreSegments) this.loadAllRequested = false;
         }
 
         // fetchMoreData 中の中間 update: テーブルだけ更新して返る
@@ -445,15 +444,7 @@ export class Visual implements IVisual {
 
         this.runFilter();
 
-        const hasMoreSegments = !!(this.lastDataView?.metadata?.segment);
         const hasActiveSearch = this.appliedConditions.some(c => c.value.trim() !== "");
-
-        // 全件読み込みが必要な場合
-        if (hasActiveSearch && hasMoreSegments) {
-            this.loadAllRequested = true;
-            this.host.fetchMoreData(true);
-            this.isLoadingMore = true;
-        }
 
         // 検索結果がある場合、全結果行を自動選択して BasicFilter でクロスフィルター適用
         if (hasActiveSearch && this.filteredRows.length > 0) {
