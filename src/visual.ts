@@ -166,8 +166,8 @@ export class Visual implements IVisual {
         // --- fetchMoreData: incremental mode で 100MB 制限を回避 ---
         // incremental mode: fetchMoreData(false) → 各チャンクのデータのみ返る
         // → 自前で蓄積するため PBI の dataView メモリ制限に引っかからない
-        const isSegment = options.operationKind === VisualDataChangeOperationKind.Segment
-            || options.operationKind === VisualDataChangeOperationKind.Append;
+        // Segment のみをインクリメンタルとして扱う（Append は PBI 側で蓄積済みなので重複する）
+        const isSegment = options.operationKind === VisualDataChangeOperationKind.Segment;
         const hasMoreSegments = !!(dv?.metadata?.segment);
 
         if (isSegment && dv?.table) {
@@ -198,9 +198,19 @@ export class Visual implements IVisual {
             this.renderStatus();
             return;
         }
-        // 読み込み完了後: 選択が蓄積されていれば BasicFilter を適用
-        if (!this.isLoadingMore && this.selectedOrigIdx.size > 0 && !isSelfFilterUpdate) {
-            this.applyDatasetFilter();
+        // 読み込み完了後: 検索中に蓄積した選択に最終チャンクのヒットも含める
+        if (isSegment && !this.isLoadingMore) {
+            this.runFilter();
+            const hasActiveSearch = this.appliedConditions.some(c => c.value.trim() !== "");
+            if (hasActiveSearch) {
+                this.filteredOrigIdx.forEach(i => this.selectedOrigIdx.add(i));
+            }
+            if (this.selectedOrigIdx.size > 0 && !isSelfFilterUpdate) {
+                this.applyDatasetFilter();
+            }
+            this.renderTableHeader();
+            this.renderVirtualRows();
+            this.renderStatus();
         }
 
         // --- 列変化検知（数・順序・名前すべて） ---
@@ -213,6 +223,9 @@ export class Visual implements IVisual {
             this.sortColIdx = -1;
             this.sortDir = null;
             this.lastClickedRi = -1;
+            // 列削除/追加で columnIndex がずれるため条件をクリア
+            this.conditions = [];
+            this.appliedConditions = [];
         }
 
         // --- 状態復元（初回 or 列構成変化時のみ）---
@@ -230,6 +243,11 @@ export class Visual implements IVisual {
             this.selectedOrigIdx.forEach(i => { if (i >= maxIdx) this.selectedOrigIdx.delete(i); });
         } else if (this.selectedValues.size > 0) {
             this.rebuildSelectionFromValues();
+            // 外部スライサーで全行除去された場合、残留フィルターを解除
+            if (this.selectedOrigIdx.size === 0) {
+                this.selectedValues.clear();
+                this.removeFilter();
+            }
         } else {
             this.selectedOrigIdx.clear();
         }
@@ -494,6 +512,7 @@ export class Visual implements IVisual {
     private commitFilter(): void {
         this.selectedOrigIdx.clear();
         this.selectedValues.clear();
+        this.lastClickedRi = -1; // フィルター結果が変わるのでリセット
 
         this.runFilter();
 
@@ -670,8 +689,11 @@ export class Visual implements IVisual {
         }
 
         const rh = this.rowHeight;
-        const startRow = Math.max(0, Math.floor(scrollTop / rh) - BUFFER);
-        const endRow   = Math.min(total, startRow + Math.ceil(viewH / rh) + BUFFER * 2);
+        // wordWrap ON の場合、行の実高さが可変になるためバッファを大幅に拡大
+        const isWordWrap = this.formattingSettings?.valuesCard?.wordWrap?.value ?? false;
+        const buf = isWordWrap ? BUFFER * 4 : BUFFER;
+        const startRow = Math.max(0, Math.floor(scrollTop / rh) - buf);
+        const endRow   = Math.min(total, startRow + Math.ceil(viewH / rh) + buf * 2);
         const beforeH  = startRow * rh;
         const afterH   = Math.max(0, (total - endRow) * rh);
         const span     = this.tableData.columns.filter((_, i) => this.isColVisible(i)).length + 1;
@@ -705,6 +727,8 @@ export class Visual implements IVisual {
         const cbTd = this.el("td", "cb-col") as HTMLTableCellElement;
         const cb   = this.el("input", "") as HTMLInputElement;
         cb.type = "checkbox"; cb.checked = sel;
+        // checkbox のネイティブ toggle を無効化（tr click ハンドラに任せる）
+        cb.addEventListener("click", (ev) => { ev.preventDefault(); });
         cbTd.appendChild(cb); tr.appendChild(cbTd);
 
         // 行全体のクリックで選択（Ctrl/Shift 対応）
@@ -855,11 +879,14 @@ export class Visual implements IVisual {
     }
 
     private rebuildSelectionFromValues(): void {
+        // 空文字を除去してから照合
+        this.selectedValues.delete("");
         if (this.selectedValues.size === 0) { this.selectedOrigIdx.clear(); return; }
         const colIdx = this.activeColTab >= 0 ? this.activeColTab : 0;
         this.selectedOrigIdx.clear();
         this.tableData.rows.forEach((row, i) => {
-            if (this.selectedValues.has(row[colIdx] ?? "")) this.selectedOrigIdx.add(i);
+            const v = row[colIdx] ?? "";
+            if (v !== "" && this.selectedValues.has(v)) this.selectedOrigIdx.add(i);
         });
     }
 
@@ -953,6 +980,7 @@ export class Visual implements IVisual {
     // 書式設定の適用
     // ==========================================================
     private applyTableStyles(): void {
+        if (!this.formattingSettings) return;
         const v = this.formattingSettings.valuesCard;
         const h = this.formattingSettings.columnHeaderCard;
         const s = this.rootEl.style;
@@ -1004,6 +1032,14 @@ export class Visual implements IVisual {
     }
 
     public getFormattingModel(): powerbi.visuals.FormattingModel {
+        if (!this.formattingSettings) {
+            this.formattingSettings = new VisualFormattingSettingsModel();
+        }
         return this.formattingSettingsService.buildFormattingModel(this.formattingSettings);
+    }
+
+    public destroy(): void {
+        if (this.persistTimer !== null) { clearTimeout(this.persistTimer); this.persistTimer = null; }
+        if (this.scrollRaf !== null) { cancelAnimationFrame(this.scrollRaf); this.scrollRaf = null; }
     }
 }
