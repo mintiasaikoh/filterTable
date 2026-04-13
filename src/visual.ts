@@ -35,7 +35,8 @@ type PrimitiveValue = string | number | boolean | null;
 interface TableData {
     columns: string[];
     rows: string[][];
-    rawRows: PrimitiveValue[][];
+    rawCol: PrimitiveValue[];  // フィルター対象列の型付き値のみ保持（RAM 節約）
+    rawColIdx: number;         // rawCol が対応する列インデックス
 }
 
 export class Visual implements IVisual {
@@ -46,7 +47,7 @@ export class Visual implements IVisual {
     // ---- データ状態 ----
     private conditions: FilterCondition[]        = [];
     private logic: "AND" | "OR"                  = "AND";
-    private tableData: TableData                 = { columns: [], rows: [], rawRows: [] };
+    private tableData: TableData                 = { columns: [], rows: [], rawCol: [], rawColIdx: -1 };
     private appliedConditions: FilterCondition[] = [];
     private appliedLogic: "AND" | "OR"           = "AND";
     private filteredRows: string[][]             = [];
@@ -310,21 +311,19 @@ export class Visual implements IVisual {
     }
 
     private extractTableData(dv: DataView): TableData {
-        if (!dv?.table) return { columns: [], rows: [], rawRows: [] };
+        if (!dv?.table) return { columns: [], rows: [], rawCol: [], rawColIdx: -1 };
         return {
             columns: dv.table.columns.map(c => c.displayName || ""),
             rows:    dv.table.rows.map(r => r.map(c => (c == null) ? "" : String(c))),
-            rawRows: dv.table.rows.map(r => r.map(c => (c == null) ? null : c as PrimitiveValue)),
+            rawCol:  [],     // フィルター適用時に遅延構築
+            rawColIdx: -1,
         };
     }
 
     private appendIncrementalData(table: DataViewTable): void {
-        // incremental mode では前回チャンクとの重複がある場合がある
-        // lastMergeIndex で重複をスキップ
         const offset = (table as unknown as Record<string, unknown>)["lastMergeIndex"] as number | undefined;
         const startIdx = (offset === undefined) ? 0 : offset + 1;
 
-        // 列情報の更新（初回のみ意味がある）
         if (this.tableData.columns.length === 0) {
             this.tableData.columns = table.columns.map(c => c.displayName || "");
         }
@@ -332,8 +331,33 @@ export class Visual implements IVisual {
         for (let i = startIdx; i < table.rows.length; i++) {
             const r = table.rows[i];
             this.tableData.rows.push(r.map(c => (c == null) ? "" : String(c)));
-            this.tableData.rawRows.push(r.map(c => (c == null) ? null : c as PrimitiveValue));
         }
+        // rawCol はフィルター対象列が変わるまでキャッシュ無効化
+        this.tableData.rawCol = [];
+        this.tableData.rawColIdx = -1;
+    }
+
+    /** フィルター対象列の型付き値を構築（全列保持せず対象列のみ） */
+    private ensureRawCol(colIdx: number): PrimitiveValue[] {
+        if (this.tableData.rawColIdx === colIdx && this.tableData.rawCol.length === this.tableData.rows.length) {
+            return this.tableData.rawCol;
+        }
+        // 最新の dataView のチャンクからは型付き値を取得可能
+        // ただし incremental mode では全行がないため、rows の文字列から型を推定
+        const rows = this.tableData.rows;
+        const raw: PrimitiveValue[] = new Array(rows.length);
+        for (let i = 0; i < rows.length; i++) {
+            const s = rows[i][colIdx];
+            if (s === "") { raw[i] = null; continue; }
+            const n = Number(s);
+            if (!isNaN(n) && s !== "") { raw[i] = n; continue; }
+            if (s === "true") { raw[i] = true; continue; }
+            if (s === "false") { raw[i] = false; continue; }
+            raw[i] = s;
+        }
+        this.tableData.rawCol = raw;
+        this.tableData.rawColIdx = colIdx;
+        return raw;
     }
 
     // ==========================================================
@@ -783,10 +807,11 @@ export class Visual implements IVisual {
             return;
         }
 
-        // 元の型付きデータから一意な値を収集（PBI フィルターは型一致が必須）
+        // フィルター対象列の型付き値を取得（対象列のみ構築、RAM 節約）
+        const rawCol = this.ensureRawCol(colIdx);
         const rawValuesSet = new Set<string | number | boolean>();
         this.selectedOrigIdx.forEach(i => {
-            const raw = this.tableData.rawRows[i]?.[colIdx];
+            const raw = rawCol[i];
             if (raw != null) rawValuesSet.add(raw as string | number | boolean);
         });
         const filterValues = Array.from(rawValuesSet);
