@@ -55,7 +55,7 @@ export class Visual implements IVisual {
     private selectedOrigIdx: Set<number>         = new Set();
     private selectedValues: Set<string>          = new Set(); // フィルター同期用の選択値
     private activeColTab  = -1;   // -1=全列表示, 0..n-1=指定列のみ表示
-    private colCount      = 0;    // 列数変化検知用
+    private prevColKey    = "";   // 列構成変化検知用（列名結合文字列）
     private lastDataView: DataView | null        = null;      // フィルター生成用
 
     // ---- DOM ----
@@ -203,10 +203,17 @@ export class Visual implements IVisual {
             this.applyDatasetFilter();
         }
 
-        // --- 列変化検知 ---
-        const colsChanged = this.tableData.columns.length !== this.colCount;
-        this.colCount = this.tableData.columns.length;
-        if (colsChanged) this.activeColTab = -1;
+        // --- 列変化検知（数・順序・名前すべて） ---
+        const colKey = this.tableData.columns.join("\0");
+        const colsChanged = colKey !== this.prevColKey;
+        this.prevColKey = colKey;
+        if (colsChanged) {
+            this.activeColTab = -1;
+            this.colWidths.clear();
+            this.sortColIdx = -1;
+            this.sortDir = null;
+            this.lastClickedRi = -1;
+        }
 
         // --- 状態復元（初回 or 列構成変化時のみ）---
         const isFirstLoad = !this.hasInteracted;
