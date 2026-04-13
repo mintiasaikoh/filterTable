@@ -71,6 +71,7 @@ export class Visual implements IVisual {
     private hasInteracted     = false;
     private hasAppliedFilter  = false; // applyJsonFilter(remove) の無駄撃ちを防ぐ
     private isLoadingMore     = false; // fetchMoreData 読み込み中フラグ
+    private dataLimitReached  = false; // 100MB メモリ制限到達フラグ
     private lastFilterJson    = "";    // 自分が適用したフィルターの JSON（自己 update 判定用）
     private persistTimer: number | null = null;
     private scrollRaf:    number | null = null;
@@ -161,14 +162,17 @@ export class Visual implements IVisual {
             && currentFilterJson === this.lastFilterJson;
         if (isSelfFilterUpdate) this.lastFilterJson = "";
 
-        // --- fetchMoreData: 常に全件取得 ---
+        // --- fetchMoreData: 常に全件取得（window + aggregation モード）---
+        // 制限: window サイズ 2-30,000、合計 1,048,576行、メモリ 100MB
         const isAppend = options.operationKind === VisualDataChangeOperationKind.Append;
         const hasMoreSegments = !!(dv?.metadata?.segment);
         if (hasMoreSegments) {
-            this.host.fetchMoreData(true);
-            this.isLoadingMore = true;
+            const accepted = this.host.fetchMoreData(true);
+            this.isLoadingMore = accepted;
+            if (!accepted) this.dataLimitReached = true;
         } else {
             this.isLoadingMore = false;
+            this.dataLimitReached = false;
         }
 
         // fetchMoreData 中の中間 update: テーブルだけ更新して返る
@@ -835,7 +839,9 @@ export class Visual implements IVisual {
         const countText = f === t ? `${t} 件` : `${f} / ${t} 件`;
 
         if (this.isLoadingMore) {
-            this.statusBar.appendChild(document.createTextNode(`${countText}（全件読み込み中…）`));
+            this.statusBar.appendChild(document.createTextNode(`${countText}（読み込み中…）`));
+        } else if (this.dataLimitReached) {
+            this.statusBar.appendChild(document.createTextNode(`${countText}（データ制限到達）`));
         } else {
             this.statusBar.appendChild(document.createTextNode(countText));
         }
