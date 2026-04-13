@@ -78,6 +78,8 @@ export class Visual implements IVisual {
     private rootEl:       HTMLElement;
     private rowHeight     = ROW_H;
     private colWidths: Map<number, number> = new Map(); // 列インデックス → px幅
+    private sortColIdx = -1;                           // ソート対象列（-1=なし）
+    private sortDir: "asc" | "desc" | null = null;     // ソート方向
 
     constructor(options: VisualConstructorOptions) {
         this.host = options.host;
@@ -478,7 +480,6 @@ export class Visual implements IVisual {
         const isAnd    = this.appliedLogic === "AND";
 
         this.tableData.rows.forEach((row, oi) => {
-            // AND: 最初の false で即 fail、OR: 最初の true で即 pass（短絡評価）
             let pass = isAnd;
             for (let k = 0; k < active.length; k++) {
                 const c     = active[k];
@@ -488,6 +489,30 @@ export class Visual implements IVisual {
             }
             if (pass) { this.filteredRows.push(row); this.filteredOrigIdx.push(oi); }
         });
+
+        this.applySort();
+    }
+
+    private applySort(): void {
+        if (this.sortColIdx < 0 || !this.sortDir) return;
+        const ci = this.sortColIdx;
+        const dir = this.sortDir === "asc" ? 1 : -1;
+
+        // インデックス配列を並べ替え、filteredRows も連動
+        const indices = this.filteredOrigIdx.map((oi, i) => i);
+        indices.sort((a, b) => {
+            const va = this.filteredRows[a][ci] ?? "";
+            const vb = this.filteredRows[b][ci] ?? "";
+            // 数値として比較可能ならば数値比較
+            const na = Number(va), nb = Number(vb);
+            if (va !== "" && vb !== "" && !isNaN(na) && !isNaN(nb)) return (na - nb) * dir;
+            return va.localeCompare(vb, undefined, { numeric: true }) * dir;
+        });
+
+        const newRows = indices.map(i => this.filteredRows[i]);
+        const newIdx  = indices.map(i => this.filteredOrigIdx[i]);
+        this.filteredRows    = newRows;
+        this.filteredOrigIdx = newIdx;
     }
 
     // ==========================================================
@@ -523,7 +548,32 @@ export class Visual implements IVisual {
         this.tableData.columns.forEach((col, i) => {
             if (!this.isColVisible(i)) return;
             const th = this.el("th", "");
-            th.textContent = col;
+
+            const label = this.el("span", "col-label");
+            label.textContent = col;
+            th.appendChild(label);
+
+            // ソートインジケータ
+            const arrow = this.el("span", "sort-indicator");
+            if (this.sortColIdx === i && this.sortDir === "asc")  arrow.textContent = " ▲";
+            else if (this.sortColIdx === i && this.sortDir === "desc") arrow.textContent = " ▼";
+            else arrow.textContent = " △"; // 未ソート
+            th.appendChild(arrow);
+
+            // ヘッダークリックでソート切替
+            th.addEventListener("click", (e) => {
+                if ((e.target as HTMLElement).classList.contains("col-resize-handle")) return;
+                if (this.sortColIdx === i) {
+                    this.sortDir = this.sortDir === "asc" ? "desc" : this.sortDir === "desc" ? null : "asc";
+                    if (!this.sortDir) this.sortColIdx = -1;
+                } else {
+                    this.sortColIdx = i;
+                    this.sortDir = "asc";
+                }
+                this.runFilter();
+                this.renderTableHeader();
+                this.renderVirtualRows();
+            });
 
             // リサイズハンドル
             const handle = this.el("div", "col-resize-handle");
@@ -533,6 +583,18 @@ export class Visual implements IVisual {
             tr.appendChild(th);
         });
         this.thead.appendChild(tr);
+
+        // 列幅が指定されている場合、テーブル幅を合計に設定して横スクロールを有効化
+        if (this.colWidths.size > 0) {
+            let total = 32; // cb col
+            this.tableData.columns.forEach((_, i) => {
+                if (!this.isColVisible(i)) return;
+                total += this.colWidths.get(i) || 120;
+            });
+            this.table.style.width = total + "px";
+        } else {
+            this.table.style.width = "";
+        }
     }
 
     private renderVirtualRows(): void {
@@ -767,21 +829,24 @@ export class Visual implements IVisual {
         e.stopPropagation();
         const startX = e.clientX;
 
-        // 現在の列幅を取得（col 要素から）
-        const cols = this.colGroup.querySelectorAll("col");
-        // cols[0] はチェックボックス列、表示列のインデックスを求める
+        // th 要素から実際の描画幅を取得（<col> は offsetWidth が常に 0）
+        const ths = this.thead.querySelectorAll("th");
         let visIdx = 0;
         for (let i = 0; i < this.tableData.columns.length; i++) {
             if (!this.isColVisible(i)) continue;
             if (i === colIdx) break;
             visIdx++;
         }
-        const colEl = cols[visIdx + 1] as HTMLElement; // +1 for cb col
-        const startW = colEl.offsetWidth || colEl.getBoundingClientRect().width || 80;
+        const thEl = ths[visIdx + 1] as HTMLElement; // +1 for cb col
+        const startW = thEl ? thEl.getBoundingClientRect().width : 80;
+
+        // 対応する col 要素も同時に更新
+        const colEls = this.colGroup.querySelectorAll("col");
+        const colEl = colEls[visIdx + 1] as HTMLElement;
 
         const onMove = (ev: MouseEvent) => {
             const newW = Math.max(40, startW + ev.clientX - startX);
-            colEl.style.width = newW + "px";
+            if (colEl) colEl.style.width = newW + "px";
             this.colWidths.set(colIdx, newW);
         };
 

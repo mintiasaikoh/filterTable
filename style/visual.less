@@ -149,7 +149,7 @@
         }
 
         .data-table {
-            width: 100%;
+            min-width: 100%;
             table-layout: fixed;
             border-collapse: collapse;
             font-size: 12px;
@@ -190,6 +190,20 @@
                     text-overflow: ellipsis;
                     position: relative;
                     &:not(:last-child) { border-right: 1px solid #e0e0e0; }
+                    cursor: pointer;
+
+                    .col-label {
+                        overflow: hidden;
+                        text-overflow: ellipsis;
+                    }
+
+                    .sort-indicator {
+                        font-size: 9px;
+                        color: #a19f9d;
+                        pointer-events: none;
+                        flex-shrink: 0;
+                    }
+                    &:hover .sort-indicator { color: #605e5c; }
 
                     .col-resize-handle {
                         position: absolute;
