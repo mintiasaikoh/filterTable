@@ -225,6 +225,9 @@ export class Visual implements IVisual {
         // --- 選択インデックスの再構築 ---
         if (isSelfFilterUpdate) {
             // 自分のフィルター応答 → selectedOrigIdx は既に正しいので維持
+            // ただし行数が変わった場合は範囲外を除去
+            const maxIdx = this.tableData.rows.length;
+            this.selectedOrigIdx.forEach(i => { if (i >= maxIdx) this.selectedOrigIdx.delete(i); });
         } else if (this.selectedValues.size > 0) {
             this.rebuildSelectionFromValues();
         } else {
@@ -448,6 +451,7 @@ export class Visual implements IVisual {
         allChip.textContent = "全列";
         allChip.onclick = () => {
             this.activeColTab = -1;
+            if (this.selectedOrigIdx.size > 0) this.applyDatasetFilter();
             this.renderColToggleBar();
             this.renderTableHeader();
             this.renderVirtualRows();
@@ -459,6 +463,8 @@ export class Visual implements IVisual {
             chip.textContent = col;
             chip.onclick = () => {
                 this.activeColTab = i;
+                // フィルター対象列が変わるので選択を再適用
+                if (this.selectedOrigIdx.size > 0) this.applyDatasetFilter();
                 this.renderColToggleBar();
                 this.renderTableHeader();
                 this.renderVirtualRows();
@@ -843,6 +849,7 @@ export class Visual implements IVisual {
 
     private removeFilter(): void {
         if (!this.hasAppliedFilter) return;
+        this.lastFilterJson = "";  // 自己フィルター判定をリセット
         this.host.applyJsonFilter(null, "general", "filter", FilterAction.remove);
         this.hasAppliedFilter = false;
     }
