@@ -80,6 +80,7 @@ export class Visual implements IVisual {
     private colWidths: Map<number, number> = new Map(); // 列インデックス → px幅
     private sortColIdx = -1;                           // ソート対象列（-1=なし）
     private sortDir: "asc" | "desc" | null = null;     // ソート方向
+    private lastClickedRi = -1;                        // Shift+クリック用の起点行
 
     constructor(options: VisualConstructorOptions) {
         this.host = options.host;
@@ -652,8 +653,15 @@ export class Visual implements IVisual {
         const cbTd = this.el("td", "cb-col") as HTMLTableCellElement;
         const cb   = this.el("input", "") as HTMLInputElement;
         cb.type = "checkbox"; cb.checked = sel;
-        cb.onchange = () => this.toggleRowSelection(ri);
+        cb.onclick = (e) => e.stopPropagation(); // 行クリックとの二重発火防止
+        cb.onchange = (e) => this.handleRowClick(ri, e as unknown as MouseEvent);
         cbTd.appendChild(cb); tr.appendChild(cbTd);
+
+        // 行クリックで選択（Ctrl/Shift 対応）
+        tr.addEventListener("click", (e) => {
+            if ((e.target as HTMLElement).tagName === "INPUT") return;
+            this.handleRowClick(ri, e);
+        });
 
         const row = this.filteredRows[ri];
         this.tableData.columns.forEach((_, i) => {
@@ -668,10 +676,29 @@ export class Visual implements IVisual {
     // ==========================================================
     // 選択
     // ==========================================================
-    private toggleRowSelection(ri: number): void {
+    private handleRowClick(ri: number, e: MouseEvent): void {
         if (ri >= this.filteredOrigIdx.length) return;
         const oi = this.filteredOrigIdx[ri];
-        this.selectedOrigIdx.has(oi) ? this.selectedOrigIdx.delete(oi) : this.selectedOrigIdx.add(oi);
+        const ctrlOrMeta = e.ctrlKey || e.metaKey;
+
+        if (e.shiftKey && this.lastClickedRi >= 0) {
+            // Shift+クリック: 範囲選択
+            const from = Math.min(this.lastClickedRi, ri);
+            const to   = Math.max(this.lastClickedRi, ri);
+            if (!ctrlOrMeta) this.selectedOrigIdx.clear();
+            for (let r = from; r <= to; r++) {
+                this.selectedOrigIdx.add(this.filteredOrigIdx[r]);
+            }
+        } else if (ctrlOrMeta) {
+            // Ctrl/Cmd+クリック: トグル追加/解除
+            this.selectedOrigIdx.has(oi) ? this.selectedOrigIdx.delete(oi) : this.selectedOrigIdx.add(oi);
+        } else {
+            // 通常クリック: 単一選択
+            this.selectedOrigIdx.clear();
+            this.selectedOrigIdx.add(oi);
+        }
+
+        this.lastClickedRi = ri;
         this.commitSelection();
     }
 
