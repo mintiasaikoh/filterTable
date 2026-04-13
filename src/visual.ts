@@ -432,6 +432,13 @@ export class Visual implements IVisual {
             this.isLoadingMore = true;
         }
 
+        // 検索結果がある場合、全結果行を自動選択してクロスフィルター適用
+        const hasActiveSearch = this.appliedConditions.some(c => c.value.trim() !== "");
+        if (hasActiveSearch && this.filteredRows.length > 0) {
+            this.filteredOrigIdx.forEach(i => this.selectedOrigIdx.add(i));
+            this.applyDatasetFilter();
+        }
+
         this.renderTableHeader();
         this.scrollEl.scrollTop = 0;
         this.renderVirtualRows();
