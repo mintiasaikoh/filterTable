@@ -194,9 +194,11 @@ export class Visual implements IVisual {
         }
 
         // --- 選択インデックスの再構築 ---
-        if (isSelfFilterUpdate || this.selectedValues.size > 0) {
+        if (isSelfFilterUpdate) {
+            // 自分のフィルター応答 → selectedOrigIdx は既に正しいので維持
+        } else if (this.selectedValues.size > 0) {
             this.rebuildSelectionFromValues();
-        } else if (!isSelfFilterUpdate) {
+        } else {
             this.selectedOrigIdx.clear();
         }
         // スクロールリセット: 初回ロードまたは外部フィルターでデータが変わった場合のみ
