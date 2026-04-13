@@ -1,83 +1,137 @@
-/*
- *  Power BI Visualizations
- *
- *  Copyright (c) Microsoft Corporation
- *  All rights reserved.
- *  MIT License
- *
- *  Permission is hereby granted, free of charge, to any person obtaining a copy
- *  of this software and associated documentation files (the ""Software""), to deal
- *  in the Software without restriction, including without limitation the rights
- *  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- *  copies of the Software, and to permit persons to whom the Software is
- *  furnished to do so, subject to the following conditions:
- *
- *  The above copyright notice and this permission notice shall be included in
- *  all copies or substantial portions of the Software.
- *
- *  THE SOFTWARE IS PROVIDED *AS IS*, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- *  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- *  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- *  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- *  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- *  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- *  THE SOFTWARE.
- */
-
 "use strict";
 
 import { formattingSettings } from "powerbi-visuals-utils-formattingmodel";
 
-import FormattingSettingsCard = formattingSettings.SimpleCard;
+import FormattingSettingsCard  = formattingSettings.SimpleCard;
 import FormattingSettingsSlice = formattingSettings.Slice;
 import FormattingSettingsModel = formattingSettings.Model;
 
-/**
- * Data Point Formatting Card
- */
-class DataPointCardSettings extends FormattingSettingsCard {
-    defaultColor = new formattingSettings.ColorPicker({
-        name: "defaultColor",
-        displayName: "Default color",
-        value: { value: "" }
+// 値（セル）の書式設定
+class ValuesCardSettings extends FormattingSettingsCard {
+    font = new formattingSettings.FontControl({
+        name: "font",
+        fontFamily: new formattingSettings.FontPicker({
+            name: "fontFamily",
+            displayName: "フォント",
+            value: "Segoe UI",
+        }),
+        fontSize: new formattingSettings.NumUpDown({
+            name: "fontSize",
+            displayName: "テキスト サイズ",
+            value: 12,
+            options: { minValue: { value: 8, type: 0 as never }, maxValue: { value: 36, type: 1 as never } },
+        }),
+        bold: new formattingSettings.ToggleSwitch({
+            name: "bold",
+            displayName: "太字",
+            value: false,
+        }),
+        italic: new formattingSettings.ToggleSwitch({
+            name: "italic",
+            displayName: "斜体",
+            value: false,
+        }),
+        underline: new formattingSettings.ToggleSwitch({
+            name: "underline",
+            displayName: "下線",
+            value: false,
+        }),
     });
 
-    showAllDataPoints = new formattingSettings.ToggleSwitch({
-        name: "showAllDataPoints",
-        displayName: "Show all",
-        value: true
+    fontColor = new formattingSettings.ColorPicker({
+        name: "fontColor",
+        displayName: "テキストの色",
+        value: { value: "#252423" },
     });
 
-    fill = new formattingSettings.ColorPicker({
-        name: "fill",
-        displayName: "Fill",
-        value: { value: "" }
+    backgroundColor = new formattingSettings.ColorPicker({
+        name: "backgroundColor",
+        displayName: "背景色",
+        value: { value: "#ffffff" },
     });
 
-    fillRule = new formattingSettings.ColorPicker({
-        name: "fillRule",
-        displayName: "Color saturation",
-        value: { value: "" }
+    altFontColor = new formattingSettings.ColorPicker({
+        name: "altFontColor",
+        displayName: "代替テキストの色",
+        value: { value: "#252423" },
     });
 
-    fontSize = new formattingSettings.NumUpDown({
-        name: "fontSize",
-        displayName: "Text Size",
-        value: 12
+    altBackgroundColor = new formattingSettings.ColorPicker({
+        name: "altBackgroundColor",
+        displayName: "代替の背景色",
+        value: { value: "#fafafa" },
     });
 
-    name: string = "dataPoint";
-    displayName: string = "Data colors";
-    slices: Array<FormattingSettingsSlice> = [this.defaultColor, this.showAllDataPoints, this.fill, this.fillRule, this.fontSize];
+    wordWrap = new formattingSettings.ToggleSwitch({
+        name: "wordWrap",
+        displayName: "テキストの折り返し",
+        value: false,
+    });
+
+    name = "values";
+    displayName = "値";
+    slices: FormattingSettingsSlice[] = [
+        this.font,
+        this.fontColor, this.backgroundColor,
+        this.altFontColor, this.altBackgroundColor,
+        this.wordWrap,
+    ];
 }
 
-/**
-* visual settings model class
-*
-*/
-export class VisualFormattingSettingsModel extends FormattingSettingsModel {
-    // Create formatting settings model formatting cards
-    dataPointCard = new DataPointCardSettings();
+// 列見出しの書式設定
+class ColumnHeaderCardSettings extends FormattingSettingsCard {
+    font = new formattingSettings.FontControl({
+        name: "font",
+        fontFamily: new formattingSettings.FontPicker({
+            name: "fontFamily",
+            displayName: "フォント",
+            value: "Segoe UI",
+        }),
+        fontSize: new formattingSettings.NumUpDown({
+            name: "fontSize",
+            displayName: "テキスト サイズ",
+            value: 13,
+            options: { minValue: { value: 8, type: 0 as never }, maxValue: { value: 36, type: 1 as never } },
+        }),
+        bold: new formattingSettings.ToggleSwitch({
+            name: "bold",
+            displayName: "太字",
+            value: true,
+        }),
+        italic: new formattingSettings.ToggleSwitch({
+            name: "italic",
+            displayName: "斜体",
+            value: false,
+        }),
+        underline: new formattingSettings.ToggleSwitch({
+            name: "underline",
+            displayName: "下線",
+            value: false,
+        }),
+    });
 
-    cards = [this.dataPointCard];
+    fontColor = new formattingSettings.ColorPicker({
+        name: "fontColor",
+        displayName: "テキストの色",
+        value: { value: "#252423" },
+    });
+
+    backgroundColor = new formattingSettings.ColorPicker({
+        name: "backgroundColor",
+        displayName: "背景色",
+        value: { value: "#f2f2f2" },
+    });
+
+    name = "columnHeader";
+    displayName = "列見出し";
+    slices: FormattingSettingsSlice[] = [
+        this.font,
+        this.fontColor, this.backgroundColor,
+    ];
+}
+
+export class VisualFormattingSettingsModel extends FormattingSettingsModel {
+    valuesCard = new ValuesCardSettings();
+    columnHeaderCard = new ColumnHeaderCardSettings();
+    cards = [this.valuesCard, this.columnHeaderCard];
 }

@@ -30,9 +30,12 @@ interface FilterCondition {
     value: string;
 }
 
+type PrimitiveValue = string | number | boolean | null;
+
 interface TableData {
     columns: string[];
     rows: string[][];
+    rawRows: PrimitiveValue[][];
 }
 
 export class Visual implements IVisual {
@@ -43,7 +46,7 @@ export class Visual implements IVisual {
     // ---- データ状態 ----
     private conditions: FilterCondition[]        = [];
     private logic: "AND" | "OR"                  = "AND";
-    private tableData: TableData                 = { columns: [], rows: [] };
+    private tableData: TableData                 = { columns: [], rows: [], rawRows: [] };
     private appliedConditions: FilterCondition[] = [];
     private appliedLogic: "AND" | "OR"           = "AND";
     private filteredRows: string[][]             = [];
@@ -74,12 +77,15 @@ export class Visual implements IVisual {
     private lastFilterJson    = "";    // 自分が適用したフィルターの JSON（自己 update 判定用）
     private persistTimer: number | null = null;
     private scrollRaf:    number | null = null;
+    private rootEl:       HTMLElement;
+    private rowHeight     = ROW_H;
 
     constructor(options: VisualConstructorOptions) {
         this.host = options.host;
         this.formattingSettingsService = new FormattingSettingsService();
-        options.element.className = "filter-table-visual";
-        this.buildDOM(options.element);
+        this.rootEl = options.element;
+        this.rootEl.className = "filter-table-visual";
+        this.buildDOM(this.rootEl);
     }
 
     private buildDOM(root: HTMLElement): void {
@@ -194,6 +200,7 @@ export class Visual implements IVisual {
         }
         this.renderColToggleBar();
         this.runFilter();
+        this.applyTableStyles();
         this.renderTableHeader();
         this.renderVirtualRows();
         this.renderStatus();
@@ -270,10 +277,11 @@ export class Visual implements IVisual {
     }
 
     private extractTableData(dv: DataView): TableData {
-        if (!dv?.table) return { columns: [], rows: [] };
+        if (!dv?.table) return { columns: [], rows: [], rawRows: [] };
         return {
             columns: dv.table.columns.map(c => c.displayName || ""),
             rows:    dv.table.rows.map(r => r.map(c => (c == null) ? "" : String(c))),
+            rawRows: dv.table.rows.map(r => r.map(c => (c == null) ? null : c as PrimitiveValue)),
         };
     }
 
@@ -429,7 +437,8 @@ export class Visual implements IVisual {
         this.renderVirtualRows();
         this.renderFilterPanel();
         this.renderStatus();
-        this.persist();
+        // persist は applyJsonFilter と同じ同期ブロックで呼ぶとフィルターが消える既知問題があるため遅延実行
+        requestAnimationFrame(() => this.persist());
     }
 
     // PBI クエリエンジンに検索条件を渡す（100k 件超のデータでも全件検索可能にする）
@@ -460,7 +469,7 @@ export class Visual implements IVisual {
         const mapOp = (op: "contains" | "notContains"): AdvancedFilterConditionOperators =>
             op === "contains" ? "Contains" : "DoesNotContain";
 
-        const filters: object[] = [];
+        const filters: (BasicFilter | AdvancedFilter)[] = [];
 
         byCol.forEach((conds, colIdx) => {
             const target = this.buildFilterTarget(dv.table.columns[colIdx]);
@@ -472,11 +481,11 @@ export class Visual implements IVisual {
             const c0: IAdvancedFilterCondition = { operator: mapOp(conds[0].operator), value: conds[0].value };
             filters.push(
                 conds.length === 1
-                    ? new AdvancedFilter(target, "And", c0).toJSON()
+                    ? new AdvancedFilter(target, "And", c0)
                     : new AdvancedFilter(
                         target, logic, c0,
                         { operator: mapOp(conds[1].operator), value: conds[1].value },
-                    ).toJSON(),
+                    ),
             );
         });
 
@@ -484,7 +493,7 @@ export class Visual implements IVisual {
 
         this.hasAppliedFilter = true;
         const filterPayload = filters.length === 1 ? filters[0] : filters;
-        this.lastFilterJson = JSON.stringify([filterPayload]);
+        this.lastFilterJson = JSON.stringify(filters.map(f => f.toJSON()));
         this.host.applyJsonFilter(filterPayload, "general", "filter", FilterAction.merge);
 
         // 同一列に3条件以上 → PBI は先頭2件のみ、残りは in-memory
@@ -570,10 +579,11 @@ export class Visual implements IVisual {
             return;
         }
 
-        const startRow = Math.max(0, Math.floor(scrollTop / ROW_H) - BUFFER);
-        const endRow   = Math.min(total, startRow + Math.ceil(viewH / ROW_H) + BUFFER * 2);
-        const beforeH  = startRow * ROW_H;
-        const afterH   = Math.max(0, (total - endRow) * ROW_H);
+        const rh = this.rowHeight;
+        const startRow = Math.max(0, Math.floor(scrollTop / rh) - BUFFER);
+        const endRow   = Math.min(total, startRow + Math.ceil(viewH / rh) + BUFFER * 2);
+        const beforeH  = startRow * rh;
+        const afterH   = Math.max(0, (total - endRow) * rh);
         const span     = this.tableData.columns.filter((_, i) => this.isColVisible(i)).length + 1;
 
         this.clear(this.tbody);
@@ -647,26 +657,32 @@ export class Visual implements IVisual {
         this.applyDatasetFilter();
         this.updateSelectionUI();
         this.renderStatus();
-        this.persist();
+        // persist は applyJsonFilter と同じ同期ブロックで呼ぶとフィルターが消える既知問題があるため遅延実行
+        requestAnimationFrame(() => this.persist());
     }
 
     private applyDatasetFilter(): void {
         const dv = this.lastDataView;
-        const colIdx = this.activeColTab >= 0 ? this.activeColTab : 0;
-
-        // selectedValues は early return の前に必ず再構築する
-        // （stale になると rebuildSelectionFromValues が誤動作する）
-        this.selectedValues.clear();
-        if (dv?.table?.columns?.length) {
-            this.selectedOrigIdx.forEach(i => {
-                const v = this.tableData.rows[i]?.[colIdx];
-                if (v != null && v !== "") this.selectedValues.add(v);
-            });
-        }
-
         if (!dv?.table?.columns?.length) return;
 
-        const target = this.buildFilterTarget(dv.table.columns[colIdx]);
+        // フィルター可能な列を決定（指定列 → フォールバック先頭の非メジャー列）
+        let colIdx = this.activeColTab >= 0 ? this.activeColTab : 0;
+        let col = dv.table.columns[colIdx];
+        let target = this.buildFilterTarget(col);
+        if (!target) {
+            // 指定列がメジャー等でフィルター不可 → 他の列を探す
+            for (let i = 0; i < dv.table.columns.length; i++) {
+                const t = this.buildFilterTarget(dv.table.columns[i]);
+                if (t) { colIdx = i; col = dv.table.columns[i]; target = t; break; }
+            }
+        }
+
+        this.selectedValues.clear();
+        this.selectedOrigIdx.forEach(i => {
+            const v = this.tableData.rows[i]?.[colIdx];
+            if (v != null && v !== "") this.selectedValues.add(v);
+        });
+
         if (!target) return;
 
         if (this.selectedValues.size === 0) {
@@ -674,20 +690,41 @@ export class Visual implements IVisual {
             return;
         }
 
-        const filter = new BasicFilter(target, "In", Array.from(this.selectedValues));
-        const filterJson = filter.toJSON();
+        // 元の型付きデータから一意な値を収集（PBI フィルターは型一致が必須）
+        const rawValuesSet = new Set<string | number | boolean>();
+        this.selectedOrigIdx.forEach(i => {
+            const raw = this.tableData.rawRows[i]?.[colIdx];
+            if (raw != null) rawValuesSet.add(raw as string | number | boolean);
+        });
+        const filterValues = Array.from(rawValuesSet);
+
+        const filter = new BasicFilter(target, "In", filterValues);
         this.hasAppliedFilter = true;
-        this.lastFilterJson = JSON.stringify([filterJson]);
-        this.host.applyJsonFilter(filterJson, "general", "filter", FilterAction.merge);
+        this.lastFilterJson = JSON.stringify([filter.toJSON()]);
+        this.host.applyJsonFilter(filter, "general", "filter", FilterAction.merge);
     }
 
     private buildFilterTarget(col: powerbi.DataViewMetadataColumn): IFilterColumnTarget | null {
-        const dotIdx = col?.queryName?.indexOf(".");
-        if (!col?.queryName || dotIdx === undefined || dotIdx < 1) return null;
-        return {
-            table:  col.queryName.substring(0, dotIdx),
-            column: col.queryName.substring(dotIdx + 1) || col.displayName,
+        if (!col?.queryName) return null;
+
+        // メジャー列（集計値）はフィルターターゲットに使えない
+        if (col.isMeasure) return null;
+
+        let qn = col.queryName;
+
+        // 集計関数でラップされている場合 (e.g. "Sum(Table.Column)") → 中身を取り出す
+        const aggMatch = qn.match(/^\w+\((.+)\)$/);
+        if (aggMatch) qn = aggMatch[1];
+
+        const dotIdx = qn.indexOf(".");
+        if (dotIdx < 1) return null;
+
+        // table: queryName のドット前、column: displayName（公式推奨パターン）
+        const target: IFilterColumnTarget = {
+            table:  qn.substring(0, dotIdx),
+            column: col.displayName,
         };
+        return target;
     }
 
     private removeFilter(): void {
@@ -748,6 +785,41 @@ export class Visual implements IVisual {
         }
     }
 
+
+    // ==========================================================
+    // 書式設定の適用
+    // ==========================================================
+    private applyTableStyles(): void {
+        const v = this.formattingSettings.valuesCard;
+        const h = this.formattingSettings.columnHeaderCard;
+        const s = this.rootEl.style;
+
+        // 値（セル）のスタイル
+        const vSize = v.font.fontSize.value;
+        s.setProperty("--val-font-family", v.font.fontFamily.value);
+        s.setProperty("--val-font-size", vSize + "pt");
+        s.setProperty("--val-font-weight", v.font.bold.value ? "bold" : "normal");
+        s.setProperty("--val-font-style", v.font.italic.value ? "italic" : "normal");
+        s.setProperty("--val-text-decoration", v.font.underline.value ? "underline" : "none");
+        s.setProperty("--val-color", v.fontColor.value.value);
+        s.setProperty("--val-bg", v.backgroundColor.value.value);
+        s.setProperty("--val-alt-color", v.altFontColor.value.value);
+        s.setProperty("--val-alt-bg", v.altBackgroundColor.value.value);
+        s.setProperty("--val-white-space", v.wordWrap.value ? "normal" : "nowrap");
+
+        // 行高さをフォントサイズに連動（pt→px換算 * 1.6 + padding）
+        this.rowHeight = Math.max(ROW_H, Math.round(vSize * 1.333 * 1.6 + 4));
+        s.setProperty("--val-row-height", this.rowHeight + "px");
+
+        // 列見出しのスタイル
+        s.setProperty("--hdr-font-family", h.font.fontFamily.value);
+        s.setProperty("--hdr-font-size", h.font.fontSize.value + "pt");
+        s.setProperty("--hdr-font-weight", h.font.bold.value ? "bold" : "normal");
+        s.setProperty("--hdr-font-style", h.font.italic.value ? "italic" : "normal");
+        s.setProperty("--hdr-text-decoration", h.font.underline.value ? "underline" : "none");
+        s.setProperty("--hdr-color", h.fontColor.value.value);
+        s.setProperty("--hdr-bg", h.backgroundColor.value.value);
+    }
 
     // ==========================================================
     // Persist

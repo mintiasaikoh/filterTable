@@ -169,32 +169,45 @@
                 th {
                     padding: 0 8px;
                     height: 28px;
-                    background: #f2f2f2;
+                    background: var(--hdr-bg, #f2f2f2);
                     border-bottom: 2px solid #d1d1d1;
                     text-align: left;
-                    font-weight: 600;
-                    color: #252423;
+                    font-family: var(--hdr-font-family, "Segoe UI", sans-serif);
+                    font-size: var(--hdr-font-size, 13px);
+                    font-weight: var(--hdr-font-weight, 600);
+                    font-style: var(--hdr-font-style, normal);
+                    text-decoration: var(--hdr-text-decoration, none);
+                    color: var(--hdr-color, #252423);
                     white-space: nowrap;
                     overflow: hidden;
                     text-overflow: ellipsis;
-                    // 縦方向の線
                     &:not(:last-child) { border-right: 1px solid #e0e0e0; }
                 }
             }
 
             tbody {
                 tr {
-                    &.row-even    { background: #fff; }
-                    &.row-odd     { background: #fafafa; }
+                    &.row-even {
+                        background: var(--val-bg, #fff);
+                        color: var(--val-color, #252423);
+                    }
+                    &.row-odd {
+                        background: var(--val-alt-bg, #fafafa);
+                        color: var(--val-alt-color, #252423);
+                    }
                     &.row-selected { background: #deecf9 !important; }
                     &:hover:not(.spacer-row) { background: #e8f4fd; }
 
                     td {
                         padding: 0 8px;
-                        height: 24px;
+                        height: var(--val-row-height, 24px);
                         border-bottom: 1px solid #f0f0f0;
-                        color: #252423;
-                        white-space: nowrap;
+                        font-family: var(--val-font-family, "Segoe UI", sans-serif);
+                        font-size: var(--val-font-size, 12px);
+                        font-weight: var(--val-font-weight, normal);
+                        font-style: var(--val-font-style, normal);
+                        text-decoration: var(--val-text-decoration, none);
+                        white-space: var(--val-white-space, nowrap);
                         overflow: hidden;
                         text-overflow: ellipsis;
                         vertical-align: middle;

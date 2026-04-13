@@ -14,6 +14,31 @@
                 }
             }
         },
+        "values": {
+            "properties": {
+                "fontFamily": { "type": { "formatting": { "fontFamily": true } } },
+                "fontSize": { "type": { "formatting": { "fontSize": true } } },
+                "bold": { "type": { "bool": true } },
+                "italic": { "type": { "bool": true } },
+                "underline": { "type": { "bool": true } },
+                "fontColor": { "type": { "fill": { "solid": { "color": true } } } },
+                "backgroundColor": { "type": { "fill": { "solid": { "color": true } } } },
+                "altFontColor": { "type": { "fill": { "solid": { "color": true } } } },
+                "altBackgroundColor": { "type": { "fill": { "solid": { "color": true } } } },
+                "wordWrap": { "type": { "bool": true } }
+            }
+        },
+        "columnHeader": {
+            "properties": {
+                "fontFamily": { "type": { "formatting": { "fontFamily": true } } },
+                "fontSize": { "type": { "formatting": { "fontSize": true } } },
+                "bold": { "type": { "bool": true } },
+                "italic": { "type": { "bool": true } },
+                "underline": { "type": { "bool": true } },
+                "fontColor": { "type": { "fill": { "solid": { "color": true } } } },
+                "backgroundColor": { "type": { "fill": { "solid": { "color": true } } } }
+            }
+        },
         "filterState": {
             "properties": {
                 "conditions": {
