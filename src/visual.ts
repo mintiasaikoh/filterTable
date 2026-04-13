@@ -653,13 +653,10 @@ export class Visual implements IVisual {
         const cbTd = this.el("td", "cb-col") as HTMLTableCellElement;
         const cb   = this.el("input", "") as HTMLInputElement;
         cb.type = "checkbox"; cb.checked = sel;
-        cb.onclick = (e) => e.stopPropagation(); // 行クリックとの二重発火防止
-        cb.onchange = (e) => this.handleRowClick(ri, e as unknown as MouseEvent);
         cbTd.appendChild(cb); tr.appendChild(cbTd);
 
-        // 行クリックで選択（Ctrl/Shift 対応）
+        // 行全体のクリックで選択（Ctrl/Shift 対応）
         tr.addEventListener("click", (e) => {
-            if ((e.target as HTMLElement).tagName === "INPUT") return;
             this.handleRowClick(ri, e);
         });
 
@@ -693,9 +690,10 @@ export class Visual implements IVisual {
             // Ctrl/Cmd+クリック: トグル追加/解除
             this.selectedOrigIdx.has(oi) ? this.selectedOrigIdx.delete(oi) : this.selectedOrigIdx.add(oi);
         } else {
-            // 通常クリック: 単一選択
+            // 通常クリック: 1件だけ選択中で同じ行なら解除、それ以外は単一選択
+            const onlyThis = this.selectedOrigIdx.size === 1 && this.selectedOrigIdx.has(oi);
             this.selectedOrigIdx.clear();
-            this.selectedOrigIdx.add(oi);
+            if (!onlyThis) this.selectedOrigIdx.add(oi);
         }
 
         this.lastClickedRi = ri;
