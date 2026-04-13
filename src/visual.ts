@@ -5,7 +5,7 @@ import { FormattingSettingsService } from "powerbi-visuals-utils-formattingmodel
 import {
     BasicFilter,
     IFilterColumnTarget,
-    IBasicFilter, IAdvancedFilter, FilterType,
+    IBasicFilter, FilterType,
 } from "powerbi-models";
 import "./../style/visual.less";
 
@@ -272,52 +272,33 @@ export class Visual implements IVisual {
             const ft = raw.filterType as number | undefined;
 
             if (ft === FilterType.Basic) {
-                // BasicFilter（選択）の復元
                 const bf = raw as unknown as IBasicFilter;
                 if (bf.operator === "In" && Array.isArray(bf.values)) {
                     this.selectedValues = new Set(bf.values.map(String));
                     this.hasAppliedFilter = true;
                 }
-            } else if (ft === FilterType.Advanced) {
-                // AdvancedFilter（検索）の復元（操作中でなければ）
-                const af = raw as unknown as IAdvancedFilter;
-                if (!af.conditions?.length) continue;
-                const target = af.target as IFilterColumnTarget | undefined;
-                if (!target?.column) continue;
-
-                let colIdx = this.tableData.columns.findIndex(c => c === target.column);
-                if (colIdx < 0) {
-                    colIdx = this.tableData.columns.findIndex((_, i) =>
-                        this.lastDataView?.table?.columns?.[i]?.queryName?.endsWith("." + target.column));
-                }
-                if (colIdx < 0) continue;
-
-                const mapOp = (op: string): "contains" | "notContains" =>
-                    op === "DoesNotContain" ? "notContains" : "contains";
-
-                const restored: FilterCondition[] = af.conditions.map(c => ({
-                    columnIndex: colIdx,
-                    operator: mapOp(c.operator as string),
-                    value: String(c.value ?? ""),
-                }));
-
-                this.appliedConditions = restored;
-                this.conditions = restored.map(c => ({ ...c }));
-                this.appliedLogic = af.logicalOperator === "Or" ? "OR" : "AND";
-                this.logic = this.appliedLogic;
-                this.hasAppliedFilter = true;
             }
         }
     }
 
     private extractTableData(dv: DataView): TableData {
         if (!dv?.table) return { columns: [], rows: [], rawCol: [], rawColIdx: -1 };
-        return {
+        const td: TableData = {
             columns: dv.table.columns.map(c => c.displayName || ""),
             rows:    dv.table.rows.map(r => r.map(c => (c == null) ? "" : String(c))),
-            rawCol:  [],     // フィルター適用時に遅延構築
+            rawCol:  [],
             rawColIdx: -1,
         };
+        // 初回ロードでフィルター対象列の型付き値を元データから取得
+        const colIdx = this.activeColTab >= 0 ? this.activeColTab : 0;
+        if (colIdx < dv.table.columns.length) {
+            td.rawCol = dv.table.rows.map(r => {
+                const v = r[colIdx];
+                return (v == null) ? null : v as PrimitiveValue;
+            });
+            td.rawColIdx = colIdx;
+        }
+        return td;
     }
 
     private appendIncrementalData(table: DataViewTable): void {
@@ -328,13 +309,16 @@ export class Visual implements IVisual {
             this.tableData.columns = table.columns.map(c => c.displayName || "");
         }
 
+        const rawColIdx = this.tableData.rawColIdx;
         for (let i = startIdx; i < table.rows.length; i++) {
             const r = table.rows[i];
             this.tableData.rows.push(r.map(c => (c == null) ? "" : String(c)));
+            // フィルター対象列の型付き値も同時に蓄積（型推定ではなく元データから）
+            if (rawColIdx >= 0 && rawColIdx < r.length) {
+                const v = r[rawColIdx];
+                this.tableData.rawCol.push((v == null) ? null : v as PrimitiveValue);
+            }
         }
-        // rawCol はフィルター対象列が変わるまでキャッシュ無効化
-        this.tableData.rawCol = [];
-        this.tableData.rawColIdx = -1;
     }
 
     /** フィルター対象列の型付き値を構築（全列保持せず対象列のみ） */
