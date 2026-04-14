@@ -388,25 +388,27 @@ export class Visual implements IVisual {
 
         const allChip = this.el("button", "col-chip" + (this.activeColTab === -1 ? " active" : ""));
         allChip.textContent = "全列";
-        allChip.onclick = () => {
-            this.activeColTab = -1;
-            this.renderColToggleBar();
-            this.renderTableHeader();
-            this.renderVirtualRows();
-        };
+        allChip.onclick = () => this.switchColTab(-1);
         this.colToggleBar.appendChild(allChip);
 
         this.tableData.columns.forEach((col, i) => {
             const chip = this.el("button", "col-chip" + (this.activeColTab === i ? " active" : ""));
             chip.textContent = col;
-            chip.onclick = () => {
-                this.activeColTab = i;
-                this.renderColToggleBar();
-                this.renderTableHeader();
-                this.renderVirtualRows();
-            };
+            chip.onclick = () => this.switchColTab(i);
             this.colToggleBar.appendChild(chip);
         });
+    }
+
+    private switchColTab(idx: number): void {
+        if (this.activeColTab === idx) return;
+        this.activeColTab = idx;
+        this.renderColToggleBar();
+        this.renderTableHeader();
+        this.renderVirtualRows();
+        // 選択行があれば BasicFilter 対象列を切替に追従して再発火（スライサー同期）
+        if (this.selectedOrigIdx.size > 0 && this.hasAppliedFilter) {
+            this.emitBasicFilterForSync();
+        }
     }
 
     private isColVisible(i: number): boolean {
