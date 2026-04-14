@@ -780,13 +780,19 @@ export class Visual implements IVisual {
     }
 
     private buildFilterTarget(col: powerbi.DataViewMetadataColumn): IFilterColumnTarget | null {
-        if (!col?.queryName || col.isMeasure) return null;
+        if (!col?.queryName) return null;
         let qn = col.queryName;
+        // 集計ラッパー "Sum(Table.Column)" 等を剥がして元列を特定
         const aggMatch = qn.match(/^\w+\((.+)\)$/);
-        if (aggMatch) qn = aggMatch[1];
+        const hasAgg = !!aggMatch;
+        if (hasAgg) qn = aggMatch[1];
+        // ラッパー無しかつ isMeasure は DAX メジャーなど元列不明 → 対象外
+        if (!hasAgg && col.isMeasure) return null;
         const dotIdx = qn.indexOf(".");
         if (dotIdx < 1) return null;
-        return { table: qn.substring(0, dotIdx), column: col.displayName };
+        // 集計列は displayName が "Sum of X" のようになるので queryName 後半を使う
+        const columnName = hasAgg ? qn.substring(dotIdx + 1) : col.displayName;
+        return { table: qn.substring(0, dotIdx), column: columnName };
     }
 
     private removeFilter(): void {
