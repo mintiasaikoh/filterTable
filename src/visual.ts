@@ -74,8 +74,7 @@ export class Visual implements IVisual {
     private hasAppliedFilter  = false; // applyJsonFilter(remove) の無駄撃ちを防ぐ
     private isLoadingMore     = false; // fetchMoreData 読み込み中フラグ
     private dataLimitReached  = false; // 100MB メモリ制限到達フラグ
-    private lastFilterJson    = "";    // 自分が適用したフィルターの JSON（無限ループ防止用）
-    private pendingSelfUpdate = false; // applyJsonFilter 後の自己 update をスキップするフラグ
+    private lastFilterJson    = "";    // 同一フィルター再適用防止用
     private persistTimer: number | null = null;
     private scrollRaf:    number | null = null;
     private rootEl:       HTMLElement;
@@ -158,27 +157,18 @@ export class Visual implements IVisual {
         const dv: DataView = options.dataViews?.[0];
         this.lastDataView = dv;
 
-        // --- 自分が適用したフィルターの応答か判定 ---
-        const isSelfFilterUpdate = this.pendingSelfUpdate;
-        if (isSelfFilterUpdate) this.pendingSelfUpdate = false;
-
-        // --- fetchMoreData: incremental mode で 100MB 制限を回避 ---
-        // incremental mode: fetchMoreData(false) → 各チャンクのデータのみ返る
-        // → 自前で蓄積するため PBI の dataView メモリ制限に引っかからない
-        // Segment のみをインクリメンタルとして扱う（Append は PBI 側で蓄積済みなので重複する）
+        // --- fetchMoreData: incremental mode ---
         const isSegment = options.operationKind === VisualDataChangeOperationKind.Segment;
         const hasMoreSegments = !!(dv?.metadata?.segment);
 
         if (isSegment && dv?.table) {
-            // インクリメンタルチャンク: 新しい行だけ追加
             this.appendIncrementalData(dv.table);
         } else {
-            // 初回ロード or フィルター変更: データ全体を置き換え
             this.tableData = this.extractTableData(dv);
         }
 
         if (hasMoreSegments) {
-            const accepted = this.host.fetchMoreData(false); // incremental mode
+            const accepted = this.host.fetchMoreData(false);
             this.isLoadingMore = accepted;
             if (!accepted) this.dataLimitReached = true;
         } else {
@@ -186,7 +176,7 @@ export class Visual implements IVisual {
             this.dataLimitReached = false;
         }
 
-        // 読み込み中の中間 update: テーブルだけ更新して返る
+        // 読み込み中の中間チャンク: テーブルだけ更新して返る
         if (isSegment && this.isLoadingMore) {
             this.runFilter();
             const hasActiveSearch = this.appliedConditions.some(c => c.value.trim() !== "");
@@ -197,22 +187,8 @@ export class Visual implements IVisual {
             this.renderStatus();
             return;
         }
-        // 読み込み完了後: 検索中に蓄積した選択に最終チャンクのヒットも含める
-        if (isSegment && !this.isLoadingMore) {
-            this.runFilter();
-            const hasActiveSearch = this.appliedConditions.some(c => c.value.trim() !== "");
-            if (hasActiveSearch) {
-                this.filteredOrigIdx.forEach(i => this.selectedOrigIdx.add(i));
-            }
-            if (this.selectedOrigIdx.size > 0 && !isSelfFilterUpdate) {
-                this.applyDatasetFilter();
-            }
-            this.renderTableHeader();
-            this.renderVirtualRows();
-            this.renderStatus();
-        }
 
-        // --- 列変化検知（数・順序・名前すべて） ---
+        // --- 列変化検知 ---
         const colKey = this.tableData.columns.join("\0");
         const colsChanged = colKey !== this.prevColKey;
         this.prevColKey = colKey;
@@ -222,7 +198,6 @@ export class Visual implements IVisual {
             this.sortColIdx = -1;
             this.sortDir = null;
             this.lastClickedRi = -1;
-            // 列削除/追加で columnIndex がずれるため条件をクリア
             this.conditions = [];
             this.appliedConditions = [];
         }
@@ -232,34 +207,20 @@ export class Visual implements IVisual {
         if (isFirstLoad || colsChanged) {
             this.restoreState(dv);
             this.restoreFromJsonFilters(options.jsonFilters);
-        }
-
-        // --- 選択インデックスの再構築 ---
-        if (isSelfFilterUpdate) {
-            // 自分のフィルター応答 → selectedOrigIdx は既に正しいので維持
-            // ただし行数が変わった場合は範囲外を除去
-            const maxIdx = this.tableData.rows.length;
-            this.selectedOrigIdx.forEach(i => { if (i >= maxIdx) this.selectedOrigIdx.delete(i); });
-        } else if (this.selectedValues.size > 0) {
-            // 既存の selectedOrigIdx が有効か検証（ページ切替時の不要な再構築を防止）
-            const colIdx = this.activeColTab >= 0 ? this.activeColTab : 0;
-            const selectionStillValid = this.selectedOrigIdx.size > 0
-                && [...this.selectedOrigIdx].every(i => {
-                    const v = this.tableData.rows[i]?.[colIdx] ?? "";
-                    return v !== "" && this.selectedValues.has(v);
-                });
-            if (!selectionStillValid) {
+            // 初回のみ selectedValues → selectedOrigIdx を構築
+            if (this.selectedValues.size > 0) {
                 this.rebuildSelectionFromValues();
             }
-            // 外部スライサーで全行除去された場合、残留フィルターを解除
-            if (this.selectedOrigIdx.size === 0) {
-                this.selectedValues.clear();
-                this.removeFilter();
-            }
-        } else {
-            this.selectedOrigIdx.clear();
         }
-        // スクロールリセット: 初回ロードまたは外部フィルターでデータが変わった場合のみ
+
+        // 範囲外インデックスを除去（行数が減った場合）
+        const maxIdx = this.tableData.rows.length;
+        this.selectedOrigIdx.forEach(i => { if (i >= maxIdx) this.selectedOrigIdx.delete(i); });
+        if (this.selectedOrigIdx.size === 0 && this.hasAppliedFilter) {
+            this.selectedValues.clear();
+            this.removeFilter();
+        }
+
         if (isFirstLoad) {
             this.scrollEl.scrollTop = 0;
         }
@@ -853,7 +814,6 @@ export class Visual implements IVisual {
 
         this.hasAppliedFilter = true;
         this.lastFilterJson = filterJson;
-        this.pendingSelfUpdate = true;
         this.host.applyJsonFilter(filter, "general", "filter", FilterAction.merge);
     }
 
@@ -883,7 +843,6 @@ export class Visual implements IVisual {
     private removeFilter(): void {
         if (!this.hasAppliedFilter) return;
         this.lastFilterJson = "";
-        this.pendingSelfUpdate = true;
         this.host.applyJsonFilter(null, "general", "filter", FilterAction.remove);
         this.hasAppliedFilter = false;
     }
