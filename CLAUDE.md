@@ -19,6 +19,7 @@ Codex will review your output once you are done
 2. **raw 値（型付き）を渡す**: `tableData.rawRows[i][ci]` を使う。`String(v)` 化すると数値/日付列で型ミスマッチして他ビジュアルで何もヒットしない
 3. **incremental モードでは自前蓄積データを参照**: `lastDataView.table.rows` は最新チャンクのみ。`tableData.rawRows` から取得
 4. **数値列の自動集計（Sum）を対象に含める**: `isMeasure=true` だけで弾くと Sale Price 等の数値列が BasicFilter から抜け落ち、他ページで絞り込めない。`queryName` が `Sum(Table.Col)` 形式なら中身を剥がして target にする。column 名は `displayName`（"Sum of X"）でなく queryName の後半を使う
+5. **日時列は Date オブジェクト**: `normalizeValue()` で ISO 文字列化して比較・signature 生成。`String(date)` はロケール依存で受信エコーが一致せず無限ループになる。`BasicFilter` には raw Date を渡す（型は `string|number|boolean[]` にキャストが必要）
 
 ## jsonFilters 受信
 
