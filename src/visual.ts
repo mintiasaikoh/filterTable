@@ -789,17 +789,10 @@ export class Visual implements IVisual {
         const dv = this.lastDataView;
         if (!dv?.table?.columns?.length) return;
 
-        // フィルター可能な列を決定（指定列 → フォールバック先頭の非メジャー列）
-        let colIdx = this.activeColTab >= 0 ? this.activeColTab : 0;
-        let col = dv.table.columns[colIdx];
-        let target = this.buildFilterTarget(col);
-        if (!target) {
-            // 指定列がメジャー等でフィルター不可 → 他の列を探す
-            for (let i = 0; i < dv.table.columns.length; i++) {
-                const t = this.buildFilterTarget(dv.table.columns[i]);
-                if (t) { colIdx = i; col = dv.table.columns[i]; target = t; break; }
-            }
-        }
+        // フィルター対象列を決定: 選択行の値がユニークな列を優先
+        const bestCol = this.findBestFilterColumn(dv);
+        if (!bestCol) return;
+        const { colIdx, target } = bestCol;
 
         this.selectedValues.clear();
         this.selectedOrigIdx.forEach(i => {
@@ -807,14 +800,11 @@ export class Visual implements IVisual {
             if (v != null && v !== "") this.selectedValues.add(v);
         });
 
-        if (!target) return;
-
         if (this.selectedValues.size === 0) {
             this.removeFilter();
             return;
         }
 
-        // フィルター対象列の型付き値を取得（対象列のみ構築、RAM 節約）
         const rawCol = this.ensureRawCol(colIdx);
         const rawValuesSet = new Set<string | number | boolean>();
         this.selectedOrigIdx.forEach(i => {
@@ -826,12 +816,48 @@ export class Visual implements IVisual {
         const filter = new BasicFilter(target, "In", filterValues);
         const filterJson = JSON.stringify([filter.toJSON()]);
 
-        // 前回と同一フィルターなら再適用しない（無限ループ防止）
         if (filterJson === this.lastFilterJson) return;
 
         this.hasAppliedFilter = true;
         this.lastFilterJson = filterJson;
         this.host.applyJsonFilter(filter, "general", "filter", FilterAction.merge);
+    }
+
+    /** 選択行の値がユニーク（=選択行だけにマッチ）な列を探す */
+    private findBestFilterColumn(dv: DataView): { colIdx: number; target: IFilterColumnTarget } | null {
+        const cols = dv.table.columns;
+        const selArr = Array.from(this.selectedOrigIdx);
+        const rows = this.tableData.rows;
+
+        // activeColTab 指定 → その列を最優先候補に
+        const startCol = this.activeColTab >= 0 ? this.activeColTab : 0;
+        let fallback: { colIdx: number; target: IFilterColumnTarget } | null = null;
+
+        // startCol を先頭にして全列を走査
+        for (let attempt = 0; attempt < cols.length; attempt++) {
+            const ci = (startCol + attempt) % cols.length;
+            const t = this.buildFilterTarget(cols[ci]);
+            if (!t) continue;
+            if (!fallback) fallback = { colIdx: ci, target: t };
+
+            // 選択行の値を集める
+            const selValues = new Set<string>();
+            for (const i of selArr) {
+                const v = rows[i]?.[ci] ?? "";
+                if (v !== "") selValues.add(v);
+            }
+            if (selValues.size === 0) continue;
+
+            // その値を持つ行数を数え、選択行数と一致するならユニーク
+            let matchCount = 0;
+            for (let r = 0; r < rows.length; r++) {
+                if (selValues.has(rows[r][ci] ?? "")) matchCount++;
+            }
+            if (matchCount === selArr.length) {
+                return { colIdx: ci, target: t };
+            }
+        }
+        return fallback;
     }
 
     private buildFilterTarget(col: powerbi.DataViewMetadataColumn): IFilterColumnTarget | null {
