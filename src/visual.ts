@@ -28,12 +28,13 @@ interface FilterCondition {
     value: string;
 }
 
-type PrimitiveValue = string | number | boolean | null;
+type PrimitiveValue = string | number | boolean | Date | null;
+type FilterValue = string | number | boolean | Date;
 
 interface TableData {
     columns: string[];
     rows: string[][];
-    rawRows: PrimitiveValue[][]; // BasicFilter 用に型を保ったまま保持
+    rawRows: PrimitiveValue[][]; // BasicFilter 用に型を保ったまま保持（Date 含む）
 }
 
 export class Visual implements IVisual {
@@ -753,16 +754,20 @@ export class Visual implements IVisual {
             const target = this.buildFilterTarget(cols[ci]);
             if (!target) continue;
 
-            const valueSet = new Set<string | number | boolean>();
+            // 正規化キーで重複排除しつつ、BasicFilter には raw（Date 含む）を渡す
+            const valueMap = new Map<string, FilterValue>();
             for (const i of selArr) {
                 const raw = this.tableData.rawRows[i]?.[ci];
-                if (raw != null && raw !== "") valueSet.add(raw as string | number | boolean);
+                if (raw == null || raw === "") continue;
+                const key = this.normalizeValue(raw);
+                if (!valueMap.has(key)) valueMap.set(key, raw as FilterValue);
             }
-            if (valueSet.size === 0) continue;
+            if (valueMap.size === 0) continue;
 
-            const values = Array.from(valueSet);
-            filters.push(new BasicFilter(target, "In", values));
-            sigParts.push(this.filterSignature(target, values));
+            // powerbi-models の型は Date を受け付けないが、実行時は受理される
+            const rawValues = Array.from(valueMap.values()) as (string | number | boolean)[];
+            filters.push(new BasicFilter(target, "In", ...rawValues));
+            sigParts.push(this.filterSignature(target, Array.from(valueMap.keys())));
         }
 
         if (filters.length === 0) return;
@@ -773,9 +778,20 @@ export class Visual implements IVisual {
         this.host.applyJsonFilter(filters, "general", "filter", FilterAction.merge);
     }
 
-    /** target + values を正規化した比較キー（toJSON の差異を回避） */
-    private filterSignature(target: IFilterColumnTarget, values: (string | number | boolean)[]): string {
-        const sorted = values.map(v => String(v)).sort();
+    /** 比較用の正規キー（Date は ISO、その他は String） */
+    private normalizeValue(v: unknown): string {
+        if (v instanceof Date) return v.toISOString();
+        if (typeof v === "string" && /^\d{4}-\d{2}-\d{2}T/.test(v)) {
+            // Power BI が jsonFilters で ISO 文字列化した Date を受け取るケース
+            const d = new Date(v);
+            if (!isNaN(d.getTime())) return d.toISOString();
+        }
+        return String(v);
+    }
+
+    /** target + 正規化済みキー配列の比較キー（toJSON の差異を回避） */
+    private filterSignature(target: IFilterColumnTarget, normalizedKeys: string[]): string {
+        const sorted = normalizedKeys.slice().sort();
         return `${target.table}\0${target.column}\0${sorted.join("\0")}`;
     }
 
@@ -809,7 +825,7 @@ export class Visual implements IVisual {
 
         const cols = dv?.table?.columns || [];
 
-        // 受信 filter を {colIdx, valueSet, sig} に正規化
+        // 受信 filter を {colIdx, valueSet(正規化), sig} に変換
         interface Parsed { colIdx: number; valueSet: Set<string>; sig: string; }
         const parsed: Parsed[] = [];
         for (const f of jsonFilters) {
@@ -825,10 +841,11 @@ export class Visual implements IVisual {
             }
             if (colIdx < 0) continue;
 
+            const normalized = values.map(v => this.normalizeValue(v));
             parsed.push({
                 colIdx,
-                valueSet: new Set(values.map(v => String(v))),
-                sig: this.filterSignature(tgt, values as (string | number | boolean)[]),
+                valueSet: new Set(normalized),
+                sig: this.filterSignature(tgt, normalized),
             });
         }
         if (parsed.length === 0) return false;
@@ -838,12 +855,13 @@ export class Visual implements IVisual {
         const selfKey = this.lastFilterJson.split("|").sort().join("|");
         if (incomingKey === selfKey) return false;
 
-        // 全ての filter に一致する行のみ選択（AND）
+        // 全ての filter に一致する行のみ選択（AND）- rawRows + normalizeValue で型差異を吸収
         this.selectedOrigIdx.clear();
-        this.tableData.rows.forEach((row, i) => {
+        this.tableData.rawRows.forEach((row, i) => {
             for (const p of parsed) {
-                const v = row[p.colIdx] ?? "";
-                if (v === "" || !p.valueSet.has(v)) return;
+                const raw = row[p.colIdx];
+                if (raw == null) return;
+                if (!p.valueSet.has(this.normalizeValue(raw))) return;
             }
             this.selectedOrigIdx.add(i);
         });
