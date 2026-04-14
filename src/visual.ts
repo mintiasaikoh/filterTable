@@ -241,7 +241,16 @@ export class Visual implements IVisual {
             const maxIdx = this.tableData.rows.length;
             this.selectedOrigIdx.forEach(i => { if (i >= maxIdx) this.selectedOrigIdx.delete(i); });
         } else if (this.selectedValues.size > 0) {
-            this.rebuildSelectionFromValues();
+            // 既存の selectedOrigIdx が有効か検証（ページ切替時の不要な再構築を防止）
+            const colIdx = this.activeColTab >= 0 ? this.activeColTab : 0;
+            const selectionStillValid = this.selectedOrigIdx.size > 0
+                && [...this.selectedOrigIdx].every(i => {
+                    const v = this.tableData.rows[i]?.[colIdx] ?? "";
+                    return v !== "" && this.selectedValues.has(v);
+                });
+            if (!selectionStillValid) {
+                this.rebuildSelectionFromValues();
+            }
             // 外部スライサーで全行除去された場合、残留フィルターを解除
             if (this.selectedOrigIdx.size === 0) {
                 this.selectedValues.clear();
