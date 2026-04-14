@@ -479,9 +479,10 @@ export class Visual implements IVisual {
     }
 
     private commitFilter(): void {
+        this.hasInteracted = true;
         this.selectedOrigIdx.clear();
         this.selectedValues.clear();
-        this.lastClickedRi = -1; // フィルター結果が変わるのでリセット
+        this.lastClickedRi = -1;
 
         this.runFilter();
 
@@ -761,6 +762,7 @@ export class Visual implements IVisual {
     }
 
     private commitSelection(): void {
+        this.hasInteracted = true;
         this.applyDatasetFilter();
         this.updateSelectionUI();
         this.renderStatus();
