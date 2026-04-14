@@ -28,9 +28,12 @@ interface FilterCondition {
     value: string;
 }
 
+type PrimitiveValue = string | number | boolean | null;
+
 interface TableData {
     columns: string[];
     rows: string[][];
+    rawRows: PrimitiveValue[][]; // BasicFilter 用に型を保ったまま保持
 }
 
 export class Visual implements IVisual {
@@ -41,7 +44,7 @@ export class Visual implements IVisual {
     // ---- データ状態 ----
     private conditions: FilterCondition[]        = [];
     private logic: "AND" | "OR"                  = "AND";
-    private tableData: TableData                 = { columns: [], rows: [] };
+    private tableData: TableData                 = { columns: [], rows: [], rawRows: [] };
     private appliedConditions: FilterCondition[] = [];
     private appliedLogic: "AND" | "OR"           = "AND";
     private filteredRows: string[][]             = [];
@@ -267,13 +270,14 @@ export class Visual implements IVisual {
     }
 
     private extractTableData(dv: DataView): TableData {
-        if (!dv?.table) { this.selectionIds = []; return { columns: [], rows: [] }; }
+        if (!dv?.table) { this.selectionIds = []; return { columns: [], rows: [], rawRows: [] }; }
         this.selectionIds = dv.table.rows.map((_, i) =>
             this.host.createSelectionIdBuilder().withTable(dv.table, i).createSelectionId()
         );
         return {
             columns: dv.table.columns.map(c => c.displayName || ""),
             rows:    dv.table.rows.map(r => r.map(c => (c == null) ? "" : String(c))),
+            rawRows: dv.table.rows.map(r => r.map(c => (c == null ? null : c)) as PrimitiveValue[]),
         };
     }
 
@@ -287,6 +291,7 @@ export class Visual implements IVisual {
 
         for (let i = startIdx; i < table.rows.length; i++) {
             this.tableData.rows.push(table.rows[i].map(c => (c == null) ? "" : String(c)));
+            this.tableData.rawRows.push(table.rows[i].map(c => (c == null ? null : c)) as PrimitiveValue[]);
             this.selectionIds.push(
                 this.host.createSelectionIdBuilder().withTable(table, i).createSelectionId()
             );
@@ -405,10 +410,7 @@ export class Visual implements IVisual {
         this.renderColToggleBar();
         this.renderTableHeader();
         this.renderVirtualRows();
-        // 選択行があれば BasicFilter 対象列を切替に追従して再発火（スライサー同期）
-        if (this.selectedOrigIdx.size > 0 && this.hasAppliedFilter) {
-            this.emitBasicFilterForSync();
-        }
+        // BasicFilter は全列で発火しているので列タブ切替時の再発火は不要
     }
 
     private isColVisible(i: number): boolean {
@@ -739,25 +741,36 @@ export class Visual implements IVisual {
         const dv = this.lastDataView;
         if (!dv?.table?.columns?.length) return;
 
-        const colIdx = this.activeColTab >= 0 ? this.activeColTab : 0;
-        const col = dv.table.columns[colIdx];
-        const target = this.buildFilterTarget(col);
-        if (!target) return;
+        const cols = dv.table.columns;
+        const selArr = Array.from(this.selectedOrigIdx);
+        if (selArr.length === 0) return;
 
-        // tableData.rows は fetchMoreData で蓄積された全件。selectedOrigIdx もこれに準拠。
-        const valuesSet = new Set<string>();
-        this.selectedOrigIdx.forEach(i => {
-            const v = this.tableData.rows[i]?.[colIdx];
-            if (v != null && v !== "") valuesSet.add(v);
-        });
-        if (valuesSet.size === 0) return;
+        // 全列に対して BasicFilter を生成（他ページのスライサー/テーブルの絞り込み精度を最大化）
+        const filters: BasicFilter[] = [];
+        const sigParts: string[] = [];
 
-        const values = Array.from(valuesSet);
-        const key = this.filterSignature(target, values);
+        for (let ci = 0; ci < cols.length; ci++) {
+            const target = this.buildFilterTarget(cols[ci]);
+            if (!target) continue;
+
+            const valueSet = new Set<string | number | boolean>();
+            for (const i of selArr) {
+                const raw = this.tableData.rawRows[i]?.[ci];
+                if (raw != null && raw !== "") valueSet.add(raw as string | number | boolean);
+            }
+            if (valueSet.size === 0) continue;
+
+            const values = Array.from(valueSet);
+            filters.push(new BasicFilter(target, "In", values));
+            sigParts.push(this.filterSignature(target, values));
+        }
+
+        if (filters.length === 0) return;
+
+        const key = sigParts.join("|");
         if (key === this.lastFilterJson) return;
         this.lastFilterJson = key;
-        const filter = new BasicFilter(target, "In", values);
-        this.host.applyJsonFilter(filter, "general", "filter", FilterAction.merge);
+        this.host.applyJsonFilter(filters, "general", "filter", FilterAction.merge);
     }
 
     /** target + values を正規化した比較キー（toJSON の差異を回避） */
@@ -789,7 +802,10 @@ export class Visual implements IVisual {
         if (!jsonFilters || jsonFilters.length === 0) return false;
 
         const cols = dv?.table?.columns || [];
-        // すべての filter を走査し、table の列に一致するものを採用
+
+        // 受信 filter を {colIdx, valueSet, sig} に正規化
+        interface Parsed { colIdx: number; valueSet: Set<string>; sig: string; }
+        const parsed: Parsed[] = [];
         for (const f of jsonFilters) {
             const bf = f as IBasicFilter;
             const tgt = bf.target as IFilterColumnTarget;
@@ -803,32 +819,45 @@ export class Visual implements IVisual {
             }
             if (colIdx < 0) continue;
 
-            const sig = this.filterSignature(tgt, values as (string | number | boolean)[]);
-            if (sig === this.lastFilterJson) return false; // 自己発火のエコー
-
-            const valueSet = new Set(values.map(v => String(v)));
-            this.selectedOrigIdx.clear();
-            this.tableData.rows.forEach((row, i) => {
-                const v = row[colIdx] ?? "";
-                if (v !== "" && valueSet.has(v)) this.selectedOrigIdx.add(i);
+            parsed.push({
+                colIdx,
+                valueSet: new Set(values.map(v => String(v))),
+                sig: this.filterSignature(tgt, values as (string | number | boolean)[]),
             });
-            this.lastFilterJson = sig;
-            // SelectionManager 側も同期（他ビジュアルへのクロスフィルター）
-            if (this.selectedOrigIdx.size > 0) {
-                const ids = Array.from(this.selectedOrigIdx)
-                    .filter(i => i < this.selectionIds.length)
-                    .map(i => this.selectionIds[i]);
-                if (ids.length > 0) {
-                    this.hasAppliedFilter = true;
-                    this.selectionManager.select(ids);
-                }
-            } else if (this.hasAppliedFilter) {
-                this.selectionManager.clear();
-                this.hasAppliedFilter = false;
-            }
-            return true;
         }
-        return false;
+        if (parsed.length === 0) return false;
+
+        // 自己発火エコー判定（同一 signature 集合）
+        const incomingKey = parsed.map(p => p.sig).sort().join("|");
+        const selfKey = this.lastFilterJson.split("|").sort().join("|");
+        if (incomingKey === selfKey) return false;
+
+        // 全ての filter に一致する行のみ選択（AND）
+        this.selectedOrigIdx.clear();
+        this.tableData.rows.forEach((row, i) => {
+            for (const p of parsed) {
+                const v = row[p.colIdx] ?? "";
+                if (v === "" || !p.valueSet.has(v)) return;
+            }
+            this.selectedOrigIdx.add(i);
+        });
+
+        this.lastFilterJson = incomingKey;
+
+        // SelectionManager 側も同期（他ビジュアルへのクロスフィルター）
+        if (this.selectedOrigIdx.size > 0) {
+            const ids = Array.from(this.selectedOrigIdx)
+                .filter(i => i < this.selectionIds.length)
+                .map(i => this.selectionIds[i]);
+            if (ids.length > 0) {
+                this.hasAppliedFilter = true;
+                this.selectionManager.select(ids);
+            }
+        } else if (this.hasAppliedFilter) {
+            this.selectionManager.clear();
+            this.hasAppliedFilter = false;
+        }
+        return true;
     }
 
 
