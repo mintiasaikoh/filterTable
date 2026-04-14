@@ -2,6 +2,7 @@
 
 import powerbi from "powerbi-visuals-api";
 import { FormattingSettingsService } from "powerbi-visuals-utils-formattingmodel";
+import { BasicFilter, IFilterColumnTarget, IBasicFilter } from "powerbi-models";
 import "./../style/visual.less";
 
 import VisualConstructorOptions = powerbi.extensibility.visual.VisualConstructorOptions;
@@ -11,6 +12,7 @@ import IVisualHost              = powerbi.extensibility.visual.IVisualHost;
 import ISelectionManager        = powerbi.extensibility.ISelectionManager;
 import ISelectionId             = powerbi.visuals.ISelectionId;
 import DataView                 = powerbi.DataView;
+import FilterAction             = powerbi.FilterAction;
 import VisualUpdateType         = powerbi.VisualUpdateType;
 import VisualDataChangeOperationKind = powerbi.VisualDataChangeOperationKind;
 import DataViewTable               = powerbi.DataViewTable;
@@ -47,6 +49,8 @@ export class Visual implements IVisual {
     private selectedOrigIdx: Set<number>         = new Set();
     private selectionIds: ISelectionId[]         = [];        // 行ごとの一意な SelectionId
     private selectionManager: ISelectionManager;
+    private lastDataView: DataView | null        = null;      // BasicFilter ターゲット生成用
+    private lastFilterJson = "";                              // 自己発火 BasicFilter の検出用（エコー除外）
     private activeColTab  = -1;   // -1=全列表示, 0..n-1=指定列のみ表示
     private prevColKey    = "";   // 列構成変化検知用（列名結合文字列）
 
@@ -147,6 +151,7 @@ export class Visual implements IVisual {
         }
 
         const dv: DataView = options.dataViews?.[0];
+        this.lastDataView = dv;
 
         // --- fetchMoreData: incremental mode ---
         const isSegment = options.operationKind === VisualDataChangeOperationKind.Segment;
@@ -206,6 +211,11 @@ export class Visual implements IVisual {
         const isFirstLoad = !this.hasInteracted;
         if (isFirstLoad || colsChanged) {
             this.restoreState(dv);
+        }
+
+        // 外部スライサーからの BasicFilter を検出 → 選択に反映（自己発火のエコーは除外）
+        if (!isFirstLoad && !colsChanged) {
+            this.restoreFromJsonFilters(dv);
         }
 
         // 範囲外インデックスを除去（行数が減った場合）
@@ -713,12 +723,84 @@ export class Visual implements IVisual {
         if (ids.length === 0) return;
         this.hasAppliedFilter = true;
         this.selectionManager.select(ids);
+
+        // スライサー同期用に BasicFilter も発火（値ベース）
+        this.emitBasicFilterForSync();
+    }
+
+    private emitBasicFilterForSync(): void {
+        const dv = this.lastDataView;
+        if (!dv?.table?.columns?.length) return;
+
+        const colIdx = this.activeColTab >= 0 ? this.activeColTab : 0;
+        const col = dv.table.columns[colIdx];
+        const target = this.buildFilterTarget(col);
+        if (!target) return;
+
+        const rawValuesSet = new Set<string | number | boolean>();
+        this.selectedOrigIdx.forEach(i => {
+            const raw = dv.table.rows[i]?.[colIdx];
+            if (raw != null && raw !== "") rawValuesSet.add(raw as string | number | boolean);
+        });
+        if (rawValuesSet.size === 0) return;
+
+        const filter = new BasicFilter(target, "In", Array.from(rawValuesSet));
+        const filterJson = JSON.stringify(filter.toJSON());
+        if (filterJson === this.lastFilterJson) return;
+        this.lastFilterJson = filterJson;
+        this.host.applyJsonFilter(filter, "general", "filter", FilterAction.merge);
+    }
+
+    private buildFilterTarget(col: powerbi.DataViewMetadataColumn): IFilterColumnTarget | null {
+        if (!col?.queryName || col.isMeasure) return null;
+        let qn = col.queryName;
+        const aggMatch = qn.match(/^\w+\((.+)\)$/);
+        if (aggMatch) qn = aggMatch[1];
+        const dotIdx = qn.indexOf(".");
+        if (dotIdx < 1) return null;
+        return { table: qn.substring(0, dotIdx), column: col.displayName };
     }
 
     private removeFilter(): void {
         if (!this.hasAppliedFilter) return;
         this.selectionManager.clear();
+        this.lastFilterJson = "";
+        this.host.applyJsonFilter(null, "general", "filter", FilterAction.remove);
         this.hasAppliedFilter = false;
+    }
+
+    /** 外部スライサーからの BasicFilter を受信した場合に選択を復元 */
+    private restoreFromJsonFilters(dv: DataView): boolean {
+        const filters = (dv?.metadata as unknown as { jsonFilters?: IBasicFilter[] })?.jsonFilters;
+        if (!filters || filters.length === 0) return false;
+
+        const incomingJson = JSON.stringify(filters[0]);
+        if (incomingJson === this.lastFilterJson) return false; // 自己発火のエコー
+
+        const f = filters[0];
+        const values = (f as IBasicFilter).values;
+        if (!values || values.length === 0) return false;
+
+        // target 列を特定
+        const tgt = (f as IBasicFilter).target as IFilterColumnTarget;
+        if (!tgt) return false;
+        const cols = dv.table?.columns || [];
+        let colIdx = -1;
+        for (let i = 0; i < cols.length; i++) {
+            const t = this.buildFilterTarget(cols[i]);
+            if (t && t.table === tgt.table && t.column === tgt.column) { colIdx = i; break; }
+        }
+        if (colIdx < 0) return false;
+
+        const valueSet = new Set(values.map(v => String(v)));
+        this.selectedOrigIdx.clear();
+        this.tableData.rows.forEach((row, i) => {
+            const v = row[colIdx] ?? "";
+            if (v !== "" && valueSet.has(v)) this.selectedOrigIdx.add(i);
+        });
+        this.lastFilterJson = incomingJson;
+        this.hasAppliedFilter = this.selectedOrigIdx.size > 0;
+        return true;
     }
 
 

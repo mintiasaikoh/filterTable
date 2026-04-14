@@ -7,6 +7,11 @@
         }
     ],
     "objects": {
+        "general": {
+            "properties": {
+                "filter": { "type": { "filter": true } }
+            }
+        },
         "values": {
             "properties": {
                 "fontFamily": { "type": { "formatting": { "fontFamily": true } } },
@@ -68,5 +73,6 @@
         }
     ],
     "supportsHighlight": true,
+    "supportsSynchronizingFilterState": true,
     "privileges": []
 }
