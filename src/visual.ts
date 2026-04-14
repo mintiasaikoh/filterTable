@@ -187,6 +187,15 @@ export class Visual implements IVisual {
             this.renderStatus();
             return;
         }
+        // 最終チャンク完了後: 蓄積した検索ヒットをフィルターとして適用
+        if (isSegment && !this.isLoadingMore) {
+            this.runFilter();
+            const hasActiveSearch = this.appliedConditions.some(c => c.value.trim() !== "");
+            if (hasActiveSearch) {
+                this.filteredOrigIdx.forEach(i => this.selectedOrigIdx.add(i));
+            }
+            if (this.selectedOrigIdx.size > 0) this.applyDatasetFilter();
+        }
 
         // --- 列変化検知 ---
         const colKey = this.tableData.columns.join("\0");
@@ -207,10 +216,6 @@ export class Visual implements IVisual {
         if (isFirstLoad || colsChanged) {
             this.restoreState(dv);
             this.restoreFromJsonFilters(options.jsonFilters);
-            // 初回のみ selectedValues → selectedOrigIdx を構築
-            if (this.selectedValues.size > 0) {
-                this.rebuildSelectionFromValues();
-            }
         }
 
         // 範囲外インデックスを除去（行数が減った場合）
@@ -249,11 +254,17 @@ export class Visual implements IVisual {
         catch { this.appliedConditions = []; }
         this.appliedLogic = (m?.["appliedLogic"] as string) === "OR" ? "OR" : "AND";
 
-        // 選択値の復元
+        // 選択の復元: インデックスを優先、なければ値からフォールバック
         try {
+            const idxStr = m?.["selectionIdx"] as string;
+            const idxArr: number[] = idxStr ? JSON.parse(idxStr) : [];
             const selStr = m?.["selection"] as string;
             const selArr: string[] = selStr ? JSON.parse(selStr) : [];
-            if (selArr.length > 0) {
+            if (idxArr.length > 0) {
+                this.selectedOrigIdx = new Set(idxArr.filter(i => i >= 0 && i < this.tableData.rows.length));
+                this.selectedValues = new Set(selArr);
+                this.hasAppliedFilter = true;
+            } else if (selArr.length > 0) {
                 this.selectedValues = new Set(selArr);
                 this.hasAppliedFilter = true;
             }
@@ -263,6 +274,8 @@ export class Visual implements IVisual {
     // スライサー同期: 他ページから同期されたフィルターを読み取って UI に反映
     private restoreFromJsonFilters(jsonFilters: powerbi.IFilter[] | undefined): void {
         if (!jsonFilters?.length || !this.tableData.columns.length) return;
+        // restoreState でインデックスから既に復元済みならスキップ
+        if (this.selectedOrigIdx.size > 0) return;
 
         for (const f of jsonFilters) {
             const raw = f as unknown as Record<string, unknown>;
@@ -273,6 +286,8 @@ export class Visual implements IVisual {
                 if (bf.operator === "In" && Array.isArray(bf.values)) {
                     this.selectedValues = new Set(bf.values.map(String));
                     this.hasAppliedFilter = true;
+                    // 値からインデックスを構築（スライサー同期ではインデックス情報がない）
+                    this.rebuildSelectionFromValues();
                 }
             }
         }
@@ -995,10 +1010,12 @@ export class Visual implements IVisual {
         this.hasInteracted = true;
         const selArr = this.selectedValues.size > 0 ? Array.from(this.selectedValues) : [];
         const selCol = this.activeColTab >= 0 ? this.activeColTab : 0;
+        const selIdx = this.selectedOrigIdx.size > 0 ? Array.from(this.selectedOrigIdx) : [];
         this.host.persistProperties({ merge: [{ objectName: "filterState", selector: null, properties: {
             conditions: JSON.stringify(this.conditions), logic: this.logic,
             applied: JSON.stringify(this.appliedConditions), appliedLogic: this.appliedLogic,
             selection: JSON.stringify(selArr), selectionCol: selCol,
+            selectionIdx: JSON.stringify(selIdx),
         }}]});
     }
 

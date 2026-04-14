@@ -64,6 +64,10 @@
                 "selectionCol": {
                     "displayName": "選択列",
                     "type": { "numeric": true }
+                },
+                "selectionIdx": {
+                    "displayName": "選択行インデックス",
+                    "type": { "text": true }
                 }
             }
         }
