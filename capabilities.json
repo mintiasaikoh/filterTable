@@ -7,13 +7,6 @@
         }
     ],
     "objects": {
-        "general": {
-            "properties": {
-                "filter": {
-                    "type": { "filter": true }
-                }
-            }
-        },
         "values": {
             "properties": {
                 "fontFamily": { "type": { "formatting": { "fontFamily": true } } },
@@ -57,14 +50,6 @@
                     "displayName": "適用済み論理演算子",
                     "type": { "text": true }
                 },
-                "selection": {
-                    "displayName": "選択値",
-                    "type": { "text": true }
-                },
-                "selectionCol": {
-                    "displayName": "選択列",
-                    "type": { "numeric": true }
-                },
                 "selectionIdx": {
                     "displayName": "選択行インデックス",
                     "type": { "text": true }
@@ -83,6 +68,5 @@
         }
     ],
     "supportsHighlight": true,
-    "supportsSynchronizingFilterState": true,
     "privileges": []
 }

@@ -2,7 +2,6 @@
 
 import powerbi from "powerbi-visuals-api";
 import { FormattingSettingsService } from "powerbi-visuals-utils-formattingmodel";
-// powerbi-models は検索フィルター用に残す（将来拡張用）
 import "./../style/visual.less";
 
 import VisualConstructorOptions = powerbi.extensibility.visual.VisualConstructorOptions;
@@ -50,7 +49,6 @@ export class Visual implements IVisual {
     private selectionManager: ISelectionManager;
     private activeColTab  = -1;   // -1=全列表示, 0..n-1=指定列のみ表示
     private prevColKey    = "";   // 列構成変化検知用（列名結合文字列）
-    private lastDataView: DataView | null        = null;      // フィルター生成用
 
     // ---- DOM ----
     private filterPanel:  HTMLElement;
@@ -149,7 +147,6 @@ export class Visual implements IVisual {
         }
 
         const dv: DataView = options.dataViews?.[0];
-        this.lastDataView = dv;
 
         // --- fetchMoreData: incremental mode ---
         const isSegment = options.operationKind === VisualDataChangeOperationKind.Segment;
@@ -381,7 +378,6 @@ export class Visual implements IVisual {
         allChip.textContent = "全列";
         allChip.onclick = () => {
             this.activeColTab = -1;
-            if (this.selectedOrigIdx.size > 0) this.applyDatasetFilter();
             this.renderColToggleBar();
             this.renderTableHeader();
             this.renderVirtualRows();
@@ -393,8 +389,6 @@ export class Visual implements IVisual {
             chip.textContent = col;
             chip.onclick = () => {
                 this.activeColTab = i;
-                // フィルター対象列が変わるので選択を再適用
-                if (this.selectedOrigIdx.size > 0) this.applyDatasetFilter();
                 this.renderColToggleBar();
                 this.renderTableHeader();
                 this.renderVirtualRows();
@@ -444,11 +438,8 @@ export class Visual implements IVisual {
         this.renderVirtualRows();
         this.renderFilterPanel();
         this.renderStatus();
-        // persist は applyJsonFilter と同じ同期ブロックで呼ぶとフィルターが消える既知問題があるため遅延実行
         requestAnimationFrame(() => this.persist());
     }
-
-
 
     private runFilter(): void {
         const active = this.appliedConditions.filter(c => c.value.trim() !== "");
@@ -707,7 +698,6 @@ export class Visual implements IVisual {
         this.applyDatasetFilter();
         this.updateSelectionUI();
         this.renderStatus();
-        // persist は applyJsonFilter と同じ同期ブロックで呼ぶとフィルターが消える既知問題があるため遅延実行
         requestAnimationFrame(() => this.persist());
     }
 
