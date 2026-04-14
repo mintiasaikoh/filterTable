@@ -214,8 +214,10 @@ export class Visual implements IVisual {
         }
 
         // 外部スライサーからの BasicFilter を検出 → 選択に反映（自己発火のエコーは除外）
-        if (!isFirstLoad && !colsChanged) {
-            this.restoreFromJsonFilters(dv);
+        // 初回ロードでも、永続化された選択がなければ slicer filter を優先
+        const hasPersistedSelection = this.selectedOrigIdx.size > 0;
+        if (!colsChanged && (!isFirstLoad || !hasPersistedSelection)) {
+            this.restoreFromJsonFilters(options.jsonFilters, dv);
         }
 
         // 範囲外インデックスを除去（行数が減った場合）
@@ -720,7 +722,10 @@ export class Visual implements IVisual {
         const ids = Array.from(this.selectedOrigIdx)
             .filter(i => i < this.selectionIds.length)
             .map(i => this.selectionIds[i]);
-        if (ids.length === 0) return;
+        if (ids.length === 0) {
+            this.removeFilter();
+            return;
+        }
         this.hasAppliedFilter = true;
         this.selectionManager.select(ids);
 
@@ -737,18 +742,26 @@ export class Visual implements IVisual {
         const target = this.buildFilterTarget(col);
         if (!target) return;
 
-        const rawValuesSet = new Set<string | number | boolean>();
+        // tableData.rows は fetchMoreData で蓄積された全件。selectedOrigIdx もこれに準拠。
+        const valuesSet = new Set<string>();
         this.selectedOrigIdx.forEach(i => {
-            const raw = dv.table.rows[i]?.[colIdx];
-            if (raw != null && raw !== "") rawValuesSet.add(raw as string | number | boolean);
+            const v = this.tableData.rows[i]?.[colIdx];
+            if (v != null && v !== "") valuesSet.add(v);
         });
-        if (rawValuesSet.size === 0) return;
+        if (valuesSet.size === 0) return;
 
-        const filter = new BasicFilter(target, "In", Array.from(rawValuesSet));
-        const filterJson = JSON.stringify(filter.toJSON());
-        if (filterJson === this.lastFilterJson) return;
-        this.lastFilterJson = filterJson;
+        const values = Array.from(valuesSet);
+        const key = this.filterSignature(target, values);
+        if (key === this.lastFilterJson) return;
+        this.lastFilterJson = key;
+        const filter = new BasicFilter(target, "In", values);
         this.host.applyJsonFilter(filter, "general", "filter", FilterAction.merge);
+    }
+
+    /** target + values を正規化した比較キー（toJSON の差異を回避） */
+    private filterSignature(target: IFilterColumnTarget, values: (string | number | boolean)[]): string {
+        const sorted = values.map(v => String(v)).sort();
+        return `${target.table}\0${target.column}\0${sorted.join("\0")}`;
     }
 
     private buildFilterTarget(col: powerbi.DataViewMetadataColumn): IFilterColumnTarget | null {
@@ -770,37 +783,50 @@ export class Visual implements IVisual {
     }
 
     /** 外部スライサーからの BasicFilter を受信した場合に選択を復元 */
-    private restoreFromJsonFilters(dv: DataView): boolean {
-        const filters = (dv?.metadata as unknown as { jsonFilters?: IBasicFilter[] })?.jsonFilters;
-        if (!filters || filters.length === 0) return false;
+    private restoreFromJsonFilters(jsonFilters: powerbi.IFilter[] | undefined, dv: DataView): boolean {
+        if (!jsonFilters || jsonFilters.length === 0) return false;
 
-        const incomingJson = JSON.stringify(filters[0]);
-        if (incomingJson === this.lastFilterJson) return false; // 自己発火のエコー
+        const cols = dv?.table?.columns || [];
+        // すべての filter を走査し、table の列に一致するものを採用
+        for (const f of jsonFilters) {
+            const bf = f as IBasicFilter;
+            const tgt = bf.target as IFilterColumnTarget;
+            const values = bf.values;
+            if (!tgt || !values || values.length === 0) continue;
 
-        const f = filters[0];
-        const values = (f as IBasicFilter).values;
-        if (!values || values.length === 0) return false;
+            let colIdx = -1;
+            for (let i = 0; i < cols.length; i++) {
+                const t = this.buildFilterTarget(cols[i]);
+                if (t && t.table === tgt.table && t.column === tgt.column) { colIdx = i; break; }
+            }
+            if (colIdx < 0) continue;
 
-        // target 列を特定
-        const tgt = (f as IBasicFilter).target as IFilterColumnTarget;
-        if (!tgt) return false;
-        const cols = dv.table?.columns || [];
-        let colIdx = -1;
-        for (let i = 0; i < cols.length; i++) {
-            const t = this.buildFilterTarget(cols[i]);
-            if (t && t.table === tgt.table && t.column === tgt.column) { colIdx = i; break; }
+            const sig = this.filterSignature(tgt, values as (string | number | boolean)[]);
+            if (sig === this.lastFilterJson) return false; // 自己発火のエコー
+
+            const valueSet = new Set(values.map(v => String(v)));
+            this.selectedOrigIdx.clear();
+            this.tableData.rows.forEach((row, i) => {
+                const v = row[colIdx] ?? "";
+                if (v !== "" && valueSet.has(v)) this.selectedOrigIdx.add(i);
+            });
+            this.lastFilterJson = sig;
+            // SelectionManager 側も同期（他ビジュアルへのクロスフィルター）
+            if (this.selectedOrigIdx.size > 0) {
+                const ids = Array.from(this.selectedOrigIdx)
+                    .filter(i => i < this.selectionIds.length)
+                    .map(i => this.selectionIds[i]);
+                if (ids.length > 0) {
+                    this.hasAppliedFilter = true;
+                    this.selectionManager.select(ids);
+                }
+            } else if (this.hasAppliedFilter) {
+                this.selectionManager.clear();
+                this.hasAppliedFilter = false;
+            }
+            return true;
         }
-        if (colIdx < 0) return false;
-
-        const valueSet = new Set(values.map(v => String(v)));
-        this.selectedOrigIdx.clear();
-        this.tableData.rows.forEach((row, i) => {
-            const v = row[colIdx] ?? "";
-            if (v !== "" && valueSet.has(v)) this.selectedOrigIdx.add(i);
-        });
-        this.lastFilterJson = incomingJson;
-        this.hasAppliedFilter = this.selectedOrigIdx.size > 0;
-        return true;
+        return false;
     }
 
 
