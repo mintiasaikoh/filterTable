@@ -74,7 +74,8 @@ export class Visual implements IVisual {
     private hasAppliedFilter  = false; // applyJsonFilter(remove) の無駄撃ちを防ぐ
     private isLoadingMore     = false; // fetchMoreData 読み込み中フラグ
     private dataLimitReached  = false; // 100MB メモリ制限到達フラグ
-    private lastFilterJson    = "";    // 自分が適用したフィルターの JSON（自己 update 判定用）
+    private lastFilterJson    = "";    // 自分が適用したフィルターの JSON（無限ループ防止用）
+    private pendingSelfUpdate = false; // applyJsonFilter 後の自己 update をスキップするフラグ
     private persistTimer: number | null = null;
     private scrollRaf:    number | null = null;
     private rootEl:       HTMLElement;
@@ -158,10 +159,8 @@ export class Visual implements IVisual {
         this.lastDataView = dv;
 
         // --- 自分が適用したフィルターの応答か判定 ---
-        const currentFilterJson = JSON.stringify(options.jsonFilters ?? []);
-        const isSelfFilterUpdate = this.lastFilterJson !== ""
-            && currentFilterJson === this.lastFilterJson;
-        if (isSelfFilterUpdate) this.lastFilterJson = "";
+        const isSelfFilterUpdate = this.pendingSelfUpdate;
+        if (isSelfFilterUpdate) this.pendingSelfUpdate = false;
 
         // --- fetchMoreData: incremental mode で 100MB 制限を回避 ---
         // incremental mode: fetchMoreData(false) → 各チャンクのデータのみ返る
@@ -845,6 +844,7 @@ export class Visual implements IVisual {
 
         this.hasAppliedFilter = true;
         this.lastFilterJson = filterJson;
+        this.pendingSelfUpdate = true;
         this.host.applyJsonFilter(filter, "general", "filter", FilterAction.merge);
     }
 
@@ -873,7 +873,8 @@ export class Visual implements IVisual {
 
     private removeFilter(): void {
         if (!this.hasAppliedFilter) return;
-        this.lastFilterJson = "";  // 自己フィルター判定をリセット
+        this.lastFilterJson = "";
+        this.pendingSelfUpdate = true;
         this.host.applyJsonFilter(null, "general", "filter", FilterAction.remove);
         this.hasAppliedFilter = false;
     }
