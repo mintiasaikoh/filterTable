@@ -2,19 +2,16 @@
 
 import powerbi from "powerbi-visuals-api";
 import { FormattingSettingsService } from "powerbi-visuals-utils-formattingmodel";
-import {
-    BasicFilter,
-    IFilterColumnTarget,
-    IBasicFilter, FilterType,
-} from "powerbi-models";
+// powerbi-models は検索フィルター用に残す（将来拡張用）
 import "./../style/visual.less";
 
 import VisualConstructorOptions = powerbi.extensibility.visual.VisualConstructorOptions;
 import VisualUpdateOptions      = powerbi.extensibility.visual.VisualUpdateOptions;
 import IVisual                  = powerbi.extensibility.visual.IVisual;
 import IVisualHost              = powerbi.extensibility.visual.IVisualHost;
+import ISelectionManager        = powerbi.extensibility.ISelectionManager;
+import ISelectionId             = powerbi.visuals.ISelectionId;
 import DataView                 = powerbi.DataView;
-import FilterAction             = powerbi.FilterAction;
 import VisualUpdateType         = powerbi.VisualUpdateType;
 import VisualDataChangeOperationKind = powerbi.VisualDataChangeOperationKind;
 import DataViewTable               = powerbi.DataViewTable;
@@ -30,13 +27,9 @@ interface FilterCondition {
     value: string;
 }
 
-type PrimitiveValue = string | number | boolean | null;
-
 interface TableData {
     columns: string[];
     rows: string[][];
-    rawCol: PrimitiveValue[];  // フィルター対象列の型付き値のみ保持（RAM 節約）
-    rawColIdx: number;         // rawCol が対応する列インデックス
 }
 
 export class Visual implements IVisual {
@@ -47,13 +40,14 @@ export class Visual implements IVisual {
     // ---- データ状態 ----
     private conditions: FilterCondition[]        = [];
     private logic: "AND" | "OR"                  = "AND";
-    private tableData: TableData                 = { columns: [], rows: [], rawCol: [], rawColIdx: -1 };
+    private tableData: TableData                 = { columns: [], rows: [] };
     private appliedConditions: FilterCondition[] = [];
     private appliedLogic: "AND" | "OR"           = "AND";
     private filteredRows: string[][]             = [];
     private filteredOrigIdx: number[]            = [];
     private selectedOrigIdx: Set<number>         = new Set();
-    private selectedValues: Set<string>          = new Set(); // フィルター同期用の選択値
+    private selectionIds: ISelectionId[]         = [];        // 行ごとの一意な SelectionId
+    private selectionManager: ISelectionManager;
     private activeColTab  = -1;   // -1=全列表示, 0..n-1=指定列のみ表示
     private prevColKey    = "";   // 列構成変化検知用（列名結合文字列）
     private lastDataView: DataView | null        = null;      // フィルター生成用
@@ -71,10 +65,9 @@ export class Visual implements IVisual {
 
     // ---- 制御フラグ ----
     private hasInteracted     = false;
-    private hasAppliedFilter  = false; // applyJsonFilter(remove) の無駄撃ちを防ぐ
+    private hasAppliedFilter  = false; // selectionManager.clear() の無駄撃ちを防ぐ
     private isLoadingMore     = false; // fetchMoreData 読み込み中フラグ
     private dataLimitReached  = false; // 100MB メモリ制限到達フラグ
-    private lastFilterJson    = "";    // 同一フィルター再適用防止用
     private persistTimer: number | null = null;
     private scrollRaf:    number | null = null;
     private rootEl:       HTMLElement;
@@ -86,6 +79,7 @@ export class Visual implements IVisual {
 
     constructor(options: VisualConstructorOptions) {
         this.host = options.host;
+        this.selectionManager = options.host.createSelectionManager();
         this.formattingSettingsService = new FormattingSettingsService();
         this.rootEl = options.element;
         this.rootEl.className = "filter-table-visual";
@@ -215,14 +209,12 @@ export class Visual implements IVisual {
         const isFirstLoad = !this.hasInteracted;
         if (isFirstLoad || colsChanged) {
             this.restoreState(dv);
-            this.restoreFromJsonFilters(options.jsonFilters);
         }
 
         // 範囲外インデックスを除去（行数が減った場合）
         const maxIdx = this.tableData.rows.length;
         this.selectedOrigIdx.forEach(i => { if (i >= maxIdx) this.selectedOrigIdx.delete(i); });
         if (this.selectedOrigIdx.size === 0 && this.hasAppliedFilter) {
-            this.selectedValues.clear();
             this.removeFilter();
         }
 
@@ -254,63 +246,26 @@ export class Visual implements IVisual {
         catch { this.appliedConditions = []; }
         this.appliedLogic = (m?.["appliedLogic"] as string) === "OR" ? "OR" : "AND";
 
-        // 選択の復元: インデックスを優先、なければ値からフォールバック
+        // 選択インデックスの復元
         try {
             const idxStr = m?.["selectionIdx"] as string;
             const idxArr: number[] = idxStr ? JSON.parse(idxStr) : [];
-            const selStr = m?.["selection"] as string;
-            const selArr: string[] = selStr ? JSON.parse(selStr) : [];
             if (idxArr.length > 0) {
                 this.selectedOrigIdx = new Set(idxArr.filter(i => i >= 0 && i < this.tableData.rows.length));
-                this.selectedValues = new Set(selArr);
-                this.hasAppliedFilter = true;
-            } else if (selArr.length > 0) {
-                this.selectedValues = new Set(selArr);
                 this.hasAppliedFilter = true;
             }
         } catch { /* 復元失敗時は空のまま */ }
     }
 
-    // スライサー同期: 他ページから同期されたフィルターを読み取って UI に反映
-    private restoreFromJsonFilters(jsonFilters: powerbi.IFilter[] | undefined): void {
-        if (!jsonFilters?.length || !this.tableData.columns.length) return;
-        // restoreState でインデックスから既に復元済みならスキップ
-        if (this.selectedOrigIdx.size > 0) return;
-
-        for (const f of jsonFilters) {
-            const raw = f as unknown as Record<string, unknown>;
-            const ft = raw.filterType as number | undefined;
-
-            if (ft === FilterType.Basic) {
-                const bf = raw as unknown as IBasicFilter;
-                if (bf.operator === "In" && Array.isArray(bf.values)) {
-                    this.selectedValues = new Set(bf.values.map(String));
-                    this.hasAppliedFilter = true;
-                    // 値からインデックスを構築（スライサー同期ではインデックス情報がない）
-                    this.rebuildSelectionFromValues();
-                }
-            }
-        }
-    }
-
     private extractTableData(dv: DataView): TableData {
-        if (!dv?.table) return { columns: [], rows: [], rawCol: [], rawColIdx: -1 };
-        const td: TableData = {
+        if (!dv?.table) { this.selectionIds = []; return { columns: [], rows: [] }; }
+        this.selectionIds = dv.table.rows.map((_, i) =>
+            this.host.createSelectionIdBuilder().withTable(dv.table, i).createSelectionId()
+        );
+        return {
             columns: dv.table.columns.map(c => c.displayName || ""),
             rows:    dv.table.rows.map(r => r.map(c => (c == null) ? "" : String(c))),
-            rawCol:  [],
-            rawColIdx: -1,
         };
-        // 初回ロードでフィルター対象列の型付き値を元データから取得
-        const colIdx = this.activeColTab >= 0 ? this.activeColTab : 0;
-        if (colIdx < dv.table.columns.length) {
-            td.rawCol = dv.table.rows.map(r => {
-                const v = r[colIdx];
-                return (v == null) ? null : v as PrimitiveValue;
-            });
-            td.rawColIdx = colIdx;
-        }
-        return td;
     }
 
     private appendIncrementalData(table: DataViewTable): void {
@@ -321,39 +276,12 @@ export class Visual implements IVisual {
             this.tableData.columns = table.columns.map(c => c.displayName || "");
         }
 
-        const rawColIdx = this.tableData.rawColIdx;
         for (let i = startIdx; i < table.rows.length; i++) {
-            const r = table.rows[i];
-            this.tableData.rows.push(r.map(c => (c == null) ? "" : String(c)));
-            // フィルター対象列の型付き値も同時に蓄積（型推定ではなく元データから）
-            if (rawColIdx >= 0 && rawColIdx < r.length) {
-                const v = r[rawColIdx];
-                this.tableData.rawCol.push((v == null) ? null : v as PrimitiveValue);
-            }
+            this.tableData.rows.push(table.rows[i].map(c => (c == null) ? "" : String(c)));
+            this.selectionIds.push(
+                this.host.createSelectionIdBuilder().withTable(table, i).createSelectionId()
+            );
         }
-    }
-
-    /** フィルター対象列の型付き値を構築（全列保持せず対象列のみ） */
-    private ensureRawCol(colIdx: number): PrimitiveValue[] {
-        if (this.tableData.rawColIdx === colIdx && this.tableData.rawCol.length === this.tableData.rows.length) {
-            return this.tableData.rawCol;
-        }
-        // 最新の dataView のチャンクからは型付き値を取得可能
-        // ただし incremental mode では全行がないため、rows の文字列から型を推定
-        const rows = this.tableData.rows;
-        const raw: PrimitiveValue[] = new Array(rows.length);
-        for (let i = 0; i < rows.length; i++) {
-            const s = rows[i][colIdx];
-            if (s === "") { raw[i] = null; continue; }
-            const n = Number(s);
-            if (!isNaN(n) && s !== "") { raw[i] = n; continue; }
-            if (s === "true") { raw[i] = true; continue; }
-            if (s === "false") { raw[i] = false; continue; }
-            raw[i] = s;
-        }
-        this.tableData.rawCol = raw;
-        this.tableData.rawColIdx = colIdx;
-        return raw;
     }
 
     // ==========================================================
@@ -496,14 +424,13 @@ export class Visual implements IVisual {
     private commitFilter(): void {
         this.hasInteracted = true;
         this.selectedOrigIdx.clear();
-        this.selectedValues.clear();
         this.lastClickedRi = -1;
 
         this.runFilter();
 
         const hasActiveSearch = this.appliedConditions.some(c => c.value.trim() !== "");
 
-        // 検索結果がある場合、全結果行を自動選択して BasicFilter でクロスフィルター適用
+        // 検索結果がある場合、全結果行を自動選択してクロスフィルター適用
         if (hasActiveSearch && this.filteredRows.length > 0) {
             this.filteredOrigIdx.forEach(i => this.selectedOrigIdx.add(i));
             this.applyDatasetFilter();
@@ -772,7 +699,6 @@ export class Visual implements IVisual {
 
     private clearSelection(): void {
         this.selectedOrigIdx.clear();
-        this.selectedValues.clear();
         this.commitSelection();
     }
 
@@ -786,121 +712,26 @@ export class Visual implements IVisual {
     }
 
     private applyDatasetFilter(): void {
-        const dv = this.lastDataView;
-        if (!dv?.table?.columns?.length) return;
-
-        // フィルター対象列を決定: 選択行の値がユニークな列を優先
-        const bestCol = this.findBestFilterColumn(dv);
-        if (!bestCol) return;
-        const { colIdx, target } = bestCol;
-
-        this.selectedValues.clear();
-        this.selectedOrigIdx.forEach(i => {
-            const v = this.tableData.rows[i]?.[colIdx];
-            if (v != null && v !== "") this.selectedValues.add(v);
-        });
-
-        if (this.selectedValues.size === 0) {
+        if (this.selectedOrigIdx.size === 0) {
             this.removeFilter();
             return;
         }
-
-        const rawCol = this.ensureRawCol(colIdx);
-        const rawValuesSet = new Set<string | number | boolean>();
-        this.selectedOrigIdx.forEach(i => {
-            const raw = rawCol[i];
-            if (raw != null) rawValuesSet.add(raw as string | number | boolean);
-        });
-        const filterValues = Array.from(rawValuesSet);
-
-        const filter = new BasicFilter(target, "In", filterValues);
-        const filterJson = JSON.stringify([filter.toJSON()]);
-
-        if (filterJson === this.lastFilterJson) return;
-
+        // SelectionId ベースで正確な行をクロスフィルター
+        const ids = Array.from(this.selectedOrigIdx)
+            .filter(i => i < this.selectionIds.length)
+            .map(i => this.selectionIds[i]);
+        if (ids.length === 0) return;
         this.hasAppliedFilter = true;
-        this.lastFilterJson = filterJson;
-        this.host.applyJsonFilter(filter, "general", "filter", FilterAction.merge);
-    }
-
-    /** 選択行の値がユニーク（=選択行だけにマッチ）な列を探す */
-    private findBestFilterColumn(dv: DataView): { colIdx: number; target: IFilterColumnTarget } | null {
-        const cols = dv.table.columns;
-        const selArr = Array.from(this.selectedOrigIdx);
-        const rows = this.tableData.rows;
-
-        // activeColTab 指定 → その列を最優先候補に
-        const startCol = this.activeColTab >= 0 ? this.activeColTab : 0;
-        let fallback: { colIdx: number; target: IFilterColumnTarget } | null = null;
-
-        // startCol を先頭にして全列を走査
-        for (let attempt = 0; attempt < cols.length; attempt++) {
-            const ci = (startCol + attempt) % cols.length;
-            const t = this.buildFilterTarget(cols[ci]);
-            if (!t) continue;
-            if (!fallback) fallback = { colIdx: ci, target: t };
-
-            // 選択行の値を集める
-            const selValues = new Set<string>();
-            for (const i of selArr) {
-                const v = rows[i]?.[ci] ?? "";
-                if (v !== "") selValues.add(v);
-            }
-            if (selValues.size === 0) continue;
-
-            // その値を持つ行数を数え、選択行数と一致するならユニーク
-            let matchCount = 0;
-            for (let r = 0; r < rows.length; r++) {
-                if (selValues.has(rows[r][ci] ?? "")) matchCount++;
-            }
-            if (matchCount === selArr.length) {
-                return { colIdx: ci, target: t };
-            }
-        }
-        return fallback;
-    }
-
-    private buildFilterTarget(col: powerbi.DataViewMetadataColumn): IFilterColumnTarget | null {
-        if (!col?.queryName) return null;
-
-        // メジャー列（集計値）はフィルターターゲットに使えない
-        if (col.isMeasure) return null;
-
-        let qn = col.queryName;
-
-        // 集計関数でラップされている場合 (e.g. "Sum(Table.Column)") → 中身を取り出す
-        const aggMatch = qn.match(/^\w+\((.+)\)$/);
-        if (aggMatch) qn = aggMatch[1];
-
-        const dotIdx = qn.indexOf(".");
-        if (dotIdx < 1) return null;
-
-        // table: queryName のドット前、column: displayName（公式推奨パターン）
-        const target: IFilterColumnTarget = {
-            table:  qn.substring(0, dotIdx),
-            column: col.displayName,
-        };
-        return target;
+        this.selectionManager.select(ids);
     }
 
     private removeFilter(): void {
         if (!this.hasAppliedFilter) return;
-        this.lastFilterJson = "";
-        this.host.applyJsonFilter(null, "general", "filter", FilterAction.remove);
+        this.selectionManager.clear();
         this.hasAppliedFilter = false;
     }
 
-    private rebuildSelectionFromValues(): void {
-        // 空文字を除去してから照合
-        this.selectedValues.delete("");
-        if (this.selectedValues.size === 0) { this.selectedOrigIdx.clear(); return; }
-        const colIdx = this.activeColTab >= 0 ? this.activeColTab : 0;
-        this.selectedOrigIdx.clear();
-        this.tableData.rows.forEach((row, i) => {
-            const v = row[colIdx] ?? "";
-            if (v !== "" && this.selectedValues.has(v)) this.selectedOrigIdx.add(i);
-        });
-    }
+
 
     private updateSelectionUI(): void {
         this.tbody.querySelectorAll("tr[data-ri]").forEach((el: Element) => {
@@ -1034,13 +865,10 @@ export class Visual implements IVisual {
 
     private persist(): void {
         this.hasInteracted = true;
-        const selArr = this.selectedValues.size > 0 ? Array.from(this.selectedValues) : [];
-        const selCol = this.activeColTab >= 0 ? this.activeColTab : 0;
         const selIdx = this.selectedOrigIdx.size > 0 ? Array.from(this.selectedOrigIdx) : [];
         this.host.persistProperties({ merge: [{ objectName: "filterState", selector: null, properties: {
             conditions: JSON.stringify(this.conditions), logic: this.logic,
             applied: JSON.stringify(this.appliedConditions), appliedLogic: this.appliedLogic,
-            selection: JSON.stringify(selArr), selectionCol: selCol,
             selectionIdx: JSON.stringify(selIdx),
         }}]});
     }
