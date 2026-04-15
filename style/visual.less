@@ -26,9 +26,19 @@
             display: flex;
             align-items: center;
             justify-content: space-between;
+            gap: 4px;
             margin-bottom: 6px;
 
             .filter-title { font-weight: 600; font-size: 13px; color: #605e5c; }
+
+            .filter-help {
+                flex: 1;
+                font-size: 11px;
+                color: #a19f9d;
+                cursor: help;
+                user-select: none;
+                &:hover { color: #0078d4; }
+            }
 
             .logic-toggle {
                 display: flex; gap: 2px;
@@ -95,6 +105,21 @@
                 &:hover  { background: #106ebe; }
                 &:active { background: #005a9e; }
             }
+
+            .add-condition-btn:disabled {
+                opacity: 0.5;
+                cursor: default;
+                border-style: solid;
+                border-color: #c8c8c8;
+                color: #a19f9d;
+                &:hover { background: transparent; }
+            }
+        }
+
+        .filter-note {
+            font-size: 11px;
+            color: #888;
+            margin-top: 4px;
         }
     }
 
@@ -240,10 +265,15 @@
                         font-weight: var(--val-font-weight, normal);
                         font-style: var(--val-font-style, normal);
                         text-decoration: var(--val-text-decoration, none);
-                        white-space: var(--val-white-space, nowrap);
+                        white-space: nowrap;
                         overflow: hidden;
                         text-overflow: ellipsis;
                         vertical-align: middle;
+
+                        // 1 列目（データ列 index 0）のみ wordWrap 設定を尊重
+                        &.first-data-col {
+                            white-space: var(--val-white-space, nowrap);
+                        }
                     }
 
                     &.spacer-row td { padding: 0; border: none; }
