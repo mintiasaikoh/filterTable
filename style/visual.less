@@ -123,6 +123,65 @@
         }
     }
 
+    // ----- 日付入力トリガー -----
+    .date-trigger {
+        cursor: pointer;
+        caret-color: transparent; // readonly でもカーソルが出るブラウザ対策
+        &:focus { border-color: #0078d4; box-shadow: 0 0 0 1px #0078d4; }
+    }
+
+    // ----- カレンダーポップアップ -----
+    .date-calendar-overlay {
+        position: fixed;
+        z-index: 1000;
+        background: #fff;
+        border: 1px solid #e0e0e0;
+        border-radius: 6px;
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.14);
+        padding: 10px;
+        width: 252px;
+        font-family: "Segoe UI", sans-serif;
+
+        .cal-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 6px;
+        }
+        .cal-nav {
+            border: none; background: none;
+            cursor: pointer; padding: 4px 8px;
+            font-size: 12px; color: #605e5c; border-radius: 3px;
+            &:hover { background: #f0f0f0; color: #252423; }
+        }
+        .cal-title {
+            font-weight: 600; font-size: 13px; color: #252423;
+        }
+
+        .cal-weekdays, .cal-grid {
+            display: grid;
+            grid-template-columns: repeat(7, 1fr);
+            text-align: center;
+        }
+        .cal-weekday {
+            font-size: 11px; color: #a19f9d;
+            padding: 2px 0; font-weight: 600;
+        }
+        .cal-cell {
+            width: 32px; height: 32px;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 12px; border: none; background: none;
+            cursor: pointer; border-radius: 50%;
+            margin: 1px auto; color: #252423;
+
+            &.cal-empty { cursor: default; }
+            &:hover:not(.cal-empty) { background: #e8f4fd; }
+            &.cal-today { font-weight: 700; border: 1px solid #0078d4; }
+            &.cal-selected { background: #0078d4; color: #fff; }
+            &.cal-selected.cal-today { border-color: #fff; }
+        }
+    }
+
     // ----- 列トグルバー -----
     .col-toggle-bar {
         flex: 0 0 auto;

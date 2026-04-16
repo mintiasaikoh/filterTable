@@ -96,6 +96,8 @@ export class Visual implements IVisual {
     private sortColIdx = -1;                           // ソート対象列（-1=なし）
     private sortDir: "asc" | "desc" | null = null;     // ソート方向
     private lastClickedRi = -1;                        // Shift+クリック用の起点行
+    private calendarOverlay: HTMLElement;               // カレンダーポップアップ（position:fixed 1 個を使い回す）
+    private activeCalendarIdx = -1;                     // 現在開いているカレンダーの条件 index（-1=閉）
 
     constructor(options: VisualConstructorOptions) {
         this.host = options.host;
@@ -122,8 +124,20 @@ export class Visual implements IVisual {
         this.table.appendChild(this.tbody);
         this.scrollEl.appendChild(this.table);
         this.tableWrapper.appendChild(this.scrollEl);
-        [this.filterPanel, this.colToggleBar, this.statusBar, this.tableWrapper]
+        // カレンダーオーバーレイ（fixed 配置で overflow:hidden を回避）
+        this.calendarOverlay = this.el("div", "date-calendar-overlay");
+        this.calendarOverlay.style.display = "none";
+
+        [this.filterPanel, this.colToggleBar, this.statusBar, this.tableWrapper, this.calendarOverlay]
             .forEach(e => root.appendChild(e));
+
+        // カレンダー外クリックで閉じる
+        root.addEventListener("mousedown", (e) => {
+            if (this.calendarOverlay.style.display !== "none"
+                && !this.calendarOverlay.contains(e.target as Node)) {
+                this.closeCalendar();
+            }
+        });
 
         this.scrollEl.addEventListener("scroll", () => {
             if (this.scrollRaf !== null) cancelAnimationFrame(this.scrollRaf);
@@ -375,7 +389,8 @@ export class Visual implements IVisual {
     // フィルターパネル
     // ==========================================================
     private renderFilterPanel(): void {
-        // 再描画前にデバウンスタイマーをキャンセル（削除後の古いクロージャが誤った条件を書き換えるのを防ぐ）
+        // 再描画前にカレンダーとデバウンスタイマーをクリア
+        this.closeCalendar();
         if (this.persistTimer !== null) { clearTimeout(this.persistTimer); this.persistTimer = null; }
         this.clear(this.filterPanel);
 
@@ -499,25 +514,142 @@ export class Visual implements IVisual {
             this.persist();
         };
 
-        const inp = this.el("input", "value-input") as HTMLInputElement;
+        let valueEl: HTMLElement;
         if (colType === "date") {
-            inp.type = "date";
-            inp.value = cond.value;
-            inp.onchange = () => { this.conditions[idx].value = inp.value; this.persist(); };
+            // カレンダーポップアップを開くクリッカブルな入力欄
+            const inp = this.el("input", "value-input date-trigger") as HTMLInputElement;
+            inp.type = "text"; inp.readOnly = true;
+            inp.placeholder = "📅 日付を選択";
+            inp.value = cond.value || "";
+            inp.onclick = (e) => { e.stopPropagation(); this.showCalendar(inp, cond, idx); };
             inp.onkeydown = (e: KeyboardEvent) => { if (e.key === "Enter") this.executeSearch(); };
+            valueEl = inp;
         } else {
+            const inp = this.el("input", "value-input") as HTMLInputElement;
             inp.type = "text";
             inp.placeholder = "検索キーワード";
             inp.value = cond.value;
             inp.oninput   = () => { this.conditions[idx].value = inp.value; this.debounceSave(); };
             inp.onkeydown = (e: KeyboardEvent) => { if (e.key === "Enter") this.executeSearch(); };
+            valueEl = inp;
         }
 
         const del = this.el("button", "remove-btn"); del.textContent = "×";
         del.onclick = () => { this.conditions.splice(idx, 1); this.persist(); this.renderFilterPanel(); };
 
-        row.appendChild(colSel); row.appendChild(opSel); row.appendChild(inp); row.appendChild(del);
+        row.appendChild(colSel); row.appendChild(opSel); row.appendChild(valueEl); row.appendChild(del);
         return row;
+    }
+
+    // ==========================================================
+    // カレンダーポップアップ
+    // position:fixed で filter-panel の overflow:hidden を回避。
+    // Power BI iframe 内でも getBoundingClientRect はビューポート基準
+    // で返るので fixed 配置と一致する。
+    // ==========================================================
+
+    private closeCalendar(): void {
+        this.calendarOverlay.style.display = "none";
+        this.activeCalendarIdx = -1;
+    }
+
+    private showCalendar(anchor: HTMLInputElement, cond: FilterCondition, idx: number): void {
+        if (this.activeCalendarIdx === idx) { this.closeCalendar(); return; }
+        this.activeCalendarIdx = idx;
+
+        const rect = anchor.getBoundingClientRect();
+        const overlay = this.calendarOverlay;
+        overlay.style.display = "block";
+        overlay.style.left = rect.left + "px";
+
+        // 描画後にサイズを取得して下か上か決める
+        this.renderCalendarContent(cond, idx, anchor);
+        const oh = overlay.offsetHeight;
+        const spaceBelow = window.innerHeight - rect.bottom;
+        overlay.style.top = (spaceBelow >= oh + 4)
+            ? (rect.bottom + 2) + "px"   // 下に余裕がある → 下向き
+            : (rect.top - oh - 2) + "px"; // 上向き
+    }
+
+    private renderCalendarContent(cond: FilterCondition, idx: number, anchor: HTMLInputElement): void {
+        const overlay = this.calendarOverlay;
+        this.clear(overlay);
+
+        let displayDate: Date;
+        if (cond.value && /^\d{4}-\d{2}-\d{2}$/.test(cond.value)) {
+            displayDate = new Date(cond.value + "T00:00:00");
+        } else {
+            displayDate = new Date();
+        }
+        let viewYear = displayDate.getFullYear();
+        let viewMonth = displayDate.getMonth();
+
+        const render = () => {
+            this.clear(overlay);
+
+            // ---- ヘッダー: ◀  2026年4月  ▶ ----
+            const header = this.el("div", "cal-header");
+            const prev = this.el("button", "cal-nav");
+            prev.textContent = "◀";
+            prev.onclick = (e) => {
+                e.stopPropagation(); viewMonth--;
+                if (viewMonth < 0) { viewMonth = 11; viewYear--; }
+                render();
+            };
+            const title = this.el("span", "cal-title");
+            title.textContent = `${viewYear}年${viewMonth + 1}月`;
+            const next = this.el("button", "cal-nav");
+            next.textContent = "▶";
+            next.onclick = (e) => {
+                e.stopPropagation(); viewMonth++;
+                if (viewMonth > 11) { viewMonth = 0; viewYear++; }
+                render();
+            };
+            header.appendChild(prev);
+            header.appendChild(title);
+            header.appendChild(next);
+            overlay.appendChild(header);
+
+            // ---- 曜日行 ----
+            const dayRow = this.el("div", "cal-weekdays");
+            for (const name of ["日", "月", "火", "水", "木", "金", "土"]) {
+                const cell = this.el("span", "cal-weekday");
+                cell.textContent = name;
+                dayRow.appendChild(cell);
+            }
+            overlay.appendChild(dayRow);
+
+            // ---- 日付グリッド ----
+            const grid = this.el("div", "cal-grid");
+            const firstDow = new Date(viewYear, viewMonth, 1).getDay();
+            const daysInMonth = new Date(viewYear, viewMonth + 1, 0).getDate();
+
+            for (let i = 0; i < firstDow; i++) {
+                grid.appendChild(this.el("span", "cal-cell cal-empty"));
+            }
+
+            const todayStr = this.formatLocalDate(new Date());
+            const selectedStr = cond.value;
+
+            for (let d = 1; d <= daysInMonth; d++) {
+                const dateStr = this.formatLocalDate(new Date(viewYear, viewMonth, d));
+                const btn = this.el("button", "cal-cell") as HTMLButtonElement;
+                btn.textContent = String(d);
+                if (dateStr === selectedStr) btn.classList.add("cal-selected");
+                if (dateStr === todayStr) btn.classList.add("cal-today");
+
+                btn.onclick = (e) => {
+                    e.stopPropagation();
+                    this.conditions[idx].value = dateStr;
+                    anchor.value = dateStr;
+                    this.closeCalendar();
+                    this.persist();
+                };
+                grid.appendChild(btn);
+            }
+            overlay.appendChild(grid);
+        };
+        render();
     }
 
     // ==========================================================
