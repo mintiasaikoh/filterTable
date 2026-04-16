@@ -101,4 +101,5 @@ interface TableData {
 - **列型変更時のリセット**: 条件行で列を切り替えた際に列型が変わったら、演算子と値をデフォルトにリセット（date→eq, text→contains）
 - **受信時の UI 未対応オペレーターはドロップ**（`In`/`NotIn` など）
 - `restoreState` の sanitize で、列型と演算子の不整合・日付値フォーマット不正を検出して修復する
-- **表示フォーマット**: 現状 `rows[i][ci] = String(Date)` でロケール依存表記（未改善 TODO）
+- **表示フォーマット**: 日付列セルは `formatLocalDate(Date) → "YYYY-MM-DD"`（ローカル TZ）で統一。`cellToString()` が `extractTableData` / `appendIncrementalData` の両方で適用する。ロケール依存の `String(Date)` は使わない
+- **共通ヘルパー**: 条件のアクティブ判定は `isConditionActive(c)`、日付比較は `toDateEpochFromString` / `toLocalDateEpoch` / `formatLocalDate` に集約。重複ロジックを書かない

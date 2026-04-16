@@ -194,7 +194,7 @@ export class Visual implements IVisual {
         // 読み込み中の中間チャンク
         if (isSegment && this.isLoadingMore) {
             this.runFilter();
-            const hasActiveSearch = this.appliedConditions.some(c => c.value.trim() !== "");
+            const hasActiveSearch = this.appliedConditions.some(c => this.isConditionActive(c));
             if (hasActiveSearch) {
                 this.filteredOrigIdx.forEach(i => this.selectedOrigIdx.add(i));
                 // AdvancedFilter 経路なら全行列挙不要 → 初回チャンクで即時発火して他ページへ反映
@@ -210,7 +210,7 @@ export class Visual implements IVisual {
         // 最終チャンク完了後: 蓄積した検索ヒットをフィルターとして適用
         if (isSegment && !this.isLoadingMore) {
             this.runFilter();
-            const hasActiveSearch = this.appliedConditions.some(c => c.value.trim() !== "");
+            const hasActiveSearch = this.appliedConditions.some(c => this.isConditionActive(c));
             if (hasActiveSearch) {
                 this.filteredOrigIdx.forEach(i => this.selectedOrigIdx.add(i));
             }
@@ -327,16 +327,28 @@ export class Visual implements IVisual {
         } catch { /* 復元失敗時は空のまま */ }
     }
 
+    /**
+     * 表示用セル値の生成。日付列は Date → "YYYY-MM-DD"（ローカル TZ）に統一。
+     * これにより JST 環境では JST 基準の年月日がそのまま表示され、
+     * ロケール依存の `String(Date)`（"Thu Apr 14 2026 ..."）を回避する。
+     */
+    private cellToString(v: PrimitiveValue, colType: ColumnType): string {
+        if (v == null) return "";
+        if (colType === "date" && v instanceof Date) return this.formatLocalDate(v);
+        return String(v);
+    }
+
     private extractTableData(dv: DataView): TableData {
         if (!dv?.table) { this.selectionIds = []; return { columns: [], rows: [], rawRows: [], types: [] }; }
         this.selectionIds = dv.table.rows.map((_, i) =>
             this.host.createSelectionIdBuilder().withTable(dv.table, i).createSelectionId()
         );
+        const types: ColumnType[] = dv.table.columns.map(c => c?.type?.dateTime ? "date" : "text");
         return {
             columns: dv.table.columns.map(c => c.displayName || ""),
-            rows:    dv.table.rows.map(r => r.map(c => (c == null) ? "" : String(c))),
+            rows:    dv.table.rows.map(r => r.map((c, ci) => this.cellToString(c as PrimitiveValue, types[ci] ?? "text"))),
             rawRows: dv.table.rows.map(r => r.map(c => (c == null ? null : c)) as PrimitiveValue[]),
-            types:   dv.table.columns.map(c => c?.type?.dateTime ? "date" : "text"),
+            types,
         };
     }
 
@@ -348,9 +360,10 @@ export class Visual implements IVisual {
             this.tableData.columns = table.columns.map(c => c.displayName || "");
             this.tableData.types   = table.columns.map(c => c?.type?.dateTime ? "date" : "text");
         }
+        const types = this.tableData.types;
 
         for (let i = startIdx; i < table.rows.length; i++) {
-            this.tableData.rows.push(table.rows[i].map(c => (c == null) ? "" : String(c)));
+            this.tableData.rows.push(table.rows[i].map((c, ci) => this.cellToString(c as PrimitiveValue, types[ci] ?? "text")));
             this.tableData.rawRows.push(table.rows[i].map(c => (c == null ? null : c)) as PrimitiveValue[]);
             this.selectionIds.push(
                 this.host.createSelectionIdBuilder().withTable(table, i).createSelectionId()
@@ -565,7 +578,7 @@ export class Visual implements IVisual {
 
         this.runFilter();
 
-        const hasActiveSearch = this.appliedConditions.some(c => c.value.trim() !== "");
+        const hasActiveSearch = this.appliedConditions.some(c => this.isConditionActive(c));
 
         // 検索結果がある場合、全結果行を自動選択してクロスフィルター適用
         if (hasActiveSearch && this.filteredRows.length > 0) {
@@ -585,7 +598,7 @@ export class Visual implements IVisual {
     }
 
     private runFilter(): void {
-        const active = this.appliedConditions.filter(c => c.value.trim() !== "");
+        const active = this.appliedConditions.filter(c => this.isConditionActive(c));
         this.filteredRows = []; this.filteredOrigIdx = [];
 
         if (active.length === 0) {
@@ -601,22 +614,13 @@ export class Visual implements IVisual {
             keyword: string;       // text 用
             valueEpoch: number;    // date 用
         }
-        const toDateEpoch = (s: string): number => {
-            if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return NaN;
-            const d = new Date(s + "T00:00:00");
-            return isNaN(d.getTime()) ? NaN : d.getTime();
-        };
-        const toRowDateEpoch = (v: unknown): number => {
-            if (!(v instanceof Date)) return NaN;
-            return new Date(v.getFullYear(), v.getMonth(), v.getDate()).getTime();
-        };
         const prep: Prepared[] = active.map(c => {
             const isDate = this.tableData.types[c.columnIndex] === "date";
             return {
                 cond: c,
                 kind: isDate ? "date" : "text",
                 keyword: isDate ? "" : c.value.toLowerCase(),
-                valueEpoch: isDate ? toDateEpoch(c.value.trim()) : NaN,
+                valueEpoch: isDate ? this.toDateEpochFromString(c.value.trim()) : NaN,
             };
         });
 
@@ -627,12 +631,13 @@ export class Visual implements IVisual {
                 const hit = (row[p.cond.columnIndex] ?? "").toLowerCase().includes(p.keyword);
                 return hit === (p.cond.operator === "contains");
             }
-            // date: rawRows から Date を取り出し時刻を 0:00 に丸めて epoch 比較
+            // date: rawRows から Date を取り出し、時刻を 0:00 に丸めてローカル epoch 比較
             const raw = this.tableData.rawRows[oi]?.[p.cond.columnIndex];
-            const rowEp = toRowDateEpoch(raw);
+            const rowEp = this.toLocalDateEpoch(raw);
             if (isNaN(p.valueEpoch)) return false; // 入力が不正ならマッチしない
             if (isNaN(rowEp)) {
-                // NaN 行は neq のみ「一致」として扱わず、いずれも false（日付なし行は絞り込まれない側）
+                // SQL 三値論理に合わせ、null/非 Date 行は全演算子で不一致扱い
+                // （Power BI 純正の日付スライサーも ≠ で null 行を残さない）
                 return false;
             }
             switch (p.cond.operator) {
@@ -928,15 +933,7 @@ export class Visual implements IVisual {
      * - 同一列 3 条件以上: false（API 仕様で 1 列 2 条件まで。UI 側で制限しているが永続化復元の保険）
      */
     private canUseAdvancedFilter(): boolean {
-        // 日付条件は value が "YYYY-MM-DD" 形式でなければ条件としてカウントしない
-        const active = this.appliedConditions.filter(c => {
-            const v = c.value.trim();
-            if (v === "") return false;
-            if (this.tableData.types[c.columnIndex] === "date") {
-                return /^\d{4}-\d{2}-\d{2}$/.test(v);
-            }
-            return true;
-        });
+        const active = this.appliedConditions.filter(c => this.isConditionActive(c));
         if (active.length === 0) return false;
 
         const byCol = new Map<number, number>();
@@ -953,15 +950,7 @@ export class Visual implements IVisual {
         const dv = this.lastDataView;
         if (!dv?.table?.columns?.length) return;
 
-        // 日付条件は YYYY-MM-DD 形式のみ通す（canUseAdvancedFilter と揃える）
-        const active = this.appliedConditions.filter(c => {
-            const v = c.value.trim();
-            if (v === "") return false;
-            if (this.tableData.types[c.columnIndex] === "date") {
-                return /^\d{4}-\d{2}-\d{2}$/.test(v);
-            }
-            return true;
-        });
+        const active = this.appliedConditions.filter(c => this.isConditionActive(c));
         if (active.length === 0) return;
 
         // 列ごとにグループ化
@@ -1092,6 +1081,47 @@ export class Visual implements IVisual {
             if (!isNaN(d.getTime())) return d.toISOString();
         }
         return String(v);
+    }
+
+    // ==========================================================
+    // 日付ユーティリティ（すべてシステムのローカルタイム基準で動作）
+    // Power BI が渡す Date はモデル上 UTC ベースだが、ユーザーが
+    // ビジュアル上で見る「日付」は必ず実行環境の TZ（例: JST）に
+    // 合わせる。getFullYear/Month/Date はシステム TZ で解釈されるので
+    // そのまま利用する（Intl.DateTimeFormat に委ねてもよいが、
+    // フォーマットは locale-neutral な YYYY-MM-DD で統一する）。
+    // ==========================================================
+
+    /** Date → "YYYY-MM-DD"（ローカルタイムの年月日） */
+    private formatLocalDate(d: Date): string {
+        const y = d.getFullYear();
+        const m = String(d.getMonth() + 1).padStart(2, "0");
+        const day = String(d.getDate()).padStart(2, "0");
+        return `${y}-${m}-${day}`;
+    }
+
+    /** "YYYY-MM-DD" → ローカル 0:00 の epoch。不正値は NaN */
+    private toDateEpochFromString(s: string): number {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return NaN;
+        // "T00:00:00" を付けると実行環境のローカル TZ で解釈される
+        const d = new Date(s + "T00:00:00");
+        return isNaN(d.getTime()) ? NaN : d.getTime();
+    }
+
+    /** 行の値 → ローカル 0:00 epoch（時刻部分を切り捨て）。Date 以外は NaN */
+    private toLocalDateEpoch(v: unknown): number {
+        if (!(v instanceof Date)) return NaN;
+        return new Date(v.getFullYear(), v.getMonth(), v.getDate()).getTime();
+    }
+
+    /** 条件が「検索に寄与するアクティブな条件」か共通判定 */
+    private isConditionActive(c: FilterCondition): boolean {
+        const v = c.value.trim();
+        if (v === "") return false;
+        if (this.tableData.types[c.columnIndex] === "date") {
+            return /^\d{4}-\d{2}-\d{2}$/.test(v);
+        }
+        return true;
     }
 
     /** target + 正規化済みキー配列の比較キー（toJSON の差異を回避） */
