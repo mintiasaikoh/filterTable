@@ -315,10 +315,6 @@ export class Visual implements IVisual {
         row.appendChild(clearBtn);
 
         this.filterPanel.appendChild(row);
-
-        const note = this.el("div", "filter-note");
-        note.textContent = "※ 検索はローカル絞り込みのみ。他ページへのクロスフィルターはチェックボックス選択で発火します。";
-        this.filterPanel.appendChild(note);
     }
 
     private applySearchLocally(): void {
@@ -387,6 +383,28 @@ export class Visual implements IVisual {
             });
         }
         this.applySort();
+        this.liftSelectedToTop();
+    }
+
+    /** 選択行を stable に最上位へ（選択内は元順維持） */
+    private liftSelectedToTop(): void {
+        if (this.selectedOrigIdx.size === 0) return;
+        const selRows: string[][] = [];
+        const selIdx: number[] = [];
+        const restRows: string[][] = [];
+        const restIdx: number[] = [];
+        for (let i = 0; i < this.filteredOrigIdx.length; i++) {
+            const oi = this.filteredOrigIdx[i];
+            if (this.selectedOrigIdx.has(oi)) {
+                selRows.push(this.filteredRows[i]);
+                selIdx.push(oi);
+            } else {
+                restRows.push(this.filteredRows[i]);
+                restIdx.push(oi);
+            }
+        }
+        this.filteredRows    = selRows.concat(restRows);
+        this.filteredOrigIdx = selIdx.concat(restIdx);
     }
 
     private applySort(): void {
@@ -592,8 +610,9 @@ export class Visual implements IVisual {
             if (!onlyThis) this.selectedOrigIdx.add(oi);
         }
 
-        this.lastClickedRi = ri;
         this.commitSelection();
+        // 並び替え後に同じ行を指す ri を再取得
+        this.lastClickedRi = this.filteredOrigIdx.indexOf(oi);
     }
 
     private toggleSelectAll(): void {
@@ -613,7 +632,10 @@ export class Visual implements IVisual {
     private commitSelection(): void {
         this.hasInteracted = true;
         this.applyDatasetFilter();
-        this.updateSelectionUI();
+        // 選択行を最上位へ並べ替え直す
+        this.runFilter();
+        this.renderTableHeader();
+        this.renderVirtualRows();
         this.renderStatus();
     }
 
