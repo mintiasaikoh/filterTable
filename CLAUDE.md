@@ -113,7 +113,16 @@ interface TableData {
 - **日付単位で比較（時刻は無視）**: 行側は `Date.UTC(getUTCFullYear, getUTCMonth, getUTCDate)`、入力側は `Date.UTC(y, m-1, d)`。両者 UTC 0:00 に揃えて epoch 比較
 - **文字列値にも対応**: PBI が ISO 文字列（`"2014-01-01T15:00:00.000Z"`）で渡すケースがある。`toDateEpoch` / `cellToString` で先頭 10 文字を正規表現抽出して処理
 - **範囲指定**: 同一列に `gte YYYY-MM-DD` + `lte YYYY-MM-DD` の 2 条件で表現（1 列 2 条件制限の範囲内）
-- **AdvancedFilter マップ**: `eq→Is` / `neq→IsNot` / `lt→LessThan` / `lte→LessThanOrEqual` / `gt→GreaterThan` / `gte→GreaterThanOrEqual`。値は UTC midnight の `Date` オブジェクトで渡す（`Date.UTC(y, m-1, d)` で生成。powerbi-models の型は `string|number|boolean` だが実行時 Date 受理。キャストが必要）
+- **AdvancedFilter は半開区間 `[start, next)` で発行する**（DateTime 列で時間成分のせいで境界漏れするのを回避）:
+  - `eq  YYYY-MM-DD` → `GreaterThanOrEqual YYYY-MM-DD AND LessThan YYYY-MM-(DD+1)` （列内 logical=And 強制）
+  - `neq YYYY-MM-DD` → `LessThan YYYY-MM-DD OR GreaterThanOrEqual YYYY-MM-(DD+1)` （列内 logical=Or 強制）
+  - `gte` / `lt` は単純マップ（`GreaterThanOrEqual` / `LessThan`）
+  - `gt  YYYY-MM-DD` → `GreaterThanOrEqual YYYY-MM-(DD+1)`
+  - `lte YYYY-MM-DD` → `LessThan YYYY-MM-(DD+1)`
+  - 同一列に 2 条件並ぶ場合（ユーザー指定範囲）は eq/neq を除外し範囲演算子のみ個別マップ（列内 2 条件制限の範囲で完結）
+  - 値は UTC midnight の `Date` オブジェクトで渡す。powerbi-models 型は `string|number|boolean` だが実行時 Date 受理（キャスト必要）
+  - 単純な `Is`/`IsNot` を使うと DateTime 列で時間込み完全一致を要求し 9 割外すため禁止
+  - エコー signature は emit / receive 両側で `${AdvancedFilterConditionOperators}:${YYYY-MM-DD}` 形式に揃える（半開区間展開後の実条件で signature を作る）
 - **エコー signature**: 値は `YYYY-MM-DD` 表記で統一（ISO 時刻込みは不安定）
 - **列型変更時のリセット**: 条件行で列を切り替えた際に列型が変わったら、演算子と値をデフォルトにリセット（date→eq, text→contains）
 - **受信時の UI 未対応オペレーターはドロップ**（`In`/`NotIn` など）

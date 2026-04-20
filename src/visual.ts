@@ -1138,25 +1138,68 @@ export class Visual implements IVisual {
         const cols = dv.table.columns;
         const filters: AdvancedFilter[] = [];
         const sigParts: string[] = [];
-        // 列内の論理演算子として appliedLogic を使う（列間は Power BI が暗黙 AND で結合）
-        const logicalOperator: AdvancedFilterLogicalOperators =
+        // 列間は Power BI が暗黙 AND で結合。列内の logicalOperator は基本 appliedLogic。
+        // ただし date 列で eq/neq 単独の場合のみ、半開区間展開に合わせて And/Or を強制上書きする。
+        const globalLogical: AdvancedFilterLogicalOperators =
             this.appliedLogic === "OR" ? "Or" : "And";
 
-        const opMapOut = (colType: ColumnType, op: FilterOp): AdvancedFilterConditionOperators | null => {
-            if (colType === "date") {
-                switch (op) {
-                    case "eq":  return "Is";
-                    case "neq": return "IsNot";
-                    case "lt":  return "LessThan";
-                    case "lte": return "LessThanOrEqual";
-                    case "gt":  return "GreaterThan";
-                    case "gte": return "GreaterThanOrEqual";
-                    default:    return null;
-                }
-            }
+        const ONE_DAY = 86400000;
+
+        // text 列の演算子マッピング（date は半開区間展開で個別処理するのでここに入れない）
+        const opMapText = (op: FilterOp): AdvancedFilterConditionOperators | null => {
             if (op === "contains")    return "Contains";
             if (op === "notContains") return "DoesNotContain";
             return null;
+        };
+
+        type CondPair = { op: AdvancedFilterConditionOperators; value: string | number | boolean | Date; sig: string };
+
+        // date 条件を「DateTime 列でも日単位で正しく効く」形に展開する。
+        // Is / IsNot / LessThanOrEqual / GreaterThan は時刻成分のせいで境界漏れを起こすため、
+        // すべて半開区間 [startOfDay, startOfNextDay) ベースで再マップする。
+        // 戻り値が 2 要素のときは forceLogical で列内演算子を強制する必要がある。
+        // sig の形式は restoreFromAdvancedFilters 側と一致させる:
+        //   `${AdvancedFilterConditionOperators}:${YYYY-MM-DD}`
+        // これにより自己発火エコー判定（lastFilterJson 比較）が emit / receive で揃う。
+        const expandDateCond = (c: FilterCondition): { pair: CondPair[]; forceLogical: AdvancedFilterLogicalOperators | null } => {
+            const epoch = toDateEpochFromString(c.value);
+            if (!Number.isFinite(epoch)) return { pair: [], forceLogical: null };
+            const start = new Date(epoch);
+            const next  = new Date(epoch + ONE_DAY);
+            const ymdStart = c.value;
+            const ymdNext  = formatDateUTC(next);
+            switch (c.operator) {
+                case "eq":
+                    // [start, next) = gte start AND lt next
+                    return {
+                        pair: [
+                            { op: "GreaterThanOrEqual", value: start, sig: `GreaterThanOrEqual:${ymdStart}` },
+                            { op: "LessThan",           value: next,  sig: `LessThan:${ymdNext}` },
+                        ],
+                        forceLogical: "And",
+                    };
+                case "neq":
+                    // NOT [start, next) = lt start OR gte next
+                    return {
+                        pair: [
+                            { op: "LessThan",           value: start, sig: `LessThan:${ymdStart}` },
+                            { op: "GreaterThanOrEqual", value: next,  sig: `GreaterThanOrEqual:${ymdNext}` },
+                        ],
+                        forceLogical: "Or",
+                    };
+                case "gte":
+                    return { pair: [{ op: "GreaterThanOrEqual", value: start, sig: `GreaterThanOrEqual:${ymdStart}` }], forceLogical: null };
+                case "lt":
+                    return { pair: [{ op: "LessThan",           value: start, sig: `LessThan:${ymdStart}` }],         forceLogical: null };
+                case "gt":
+                    // x > YYYY-MM-DD  ⇔  x >= YYYY-MM-(DD+1)
+                    return { pair: [{ op: "GreaterThanOrEqual", value: next,  sig: `GreaterThanOrEqual:${ymdNext}` }], forceLogical: null };
+                case "lte":
+                    // x <= YYYY-MM-DD ⇔  x <  YYYY-MM-(DD+1)
+                    return { pair: [{ op: "LessThan",           value: next,  sig: `LessThan:${ymdNext}` }],          forceLogical: null };
+                default:
+                    return { pair: [], forceLogical: null };
+            }
         };
 
         for (const [ci, conds] of byCol) {
@@ -1168,27 +1211,42 @@ export class Visual implements IVisual {
             const colType: ColumnType = this.tableData.types[ci] ?? "text";
             const advConds: IAdvancedFilterCondition[] = [];
             const sigItems: string[] = [];
-            for (const c of conds) {
-                const op = opMapOut(colType, c.operator);
-                if (!op) continue;
-                // 日付は UTC midnight の Date で渡す（powerbi-models は型定義上 string|number|boolean だが実行時 Date も受理）
-                let value: string | number | boolean | Date;
-                if (colType === "date") {
-                    const epoch = toDateEpochFromString(c.value);
-                    if (!Number.isFinite(epoch)) continue; // 不正日付文字列は skip
-                    value = new Date(epoch);
+            let colLogical: AdvancedFilterLogicalOperators = globalLogical;
+
+            if (colType === "date") {
+                // date 列: 単独条件なら半開区間展開を適用（列内 2 条件制限の範囲で完結）。
+                // 複数条件が並んでる場合は展開せずに個別マップ（gte + lte などのユーザー指定範囲は既に正しい）。
+                if (conds.length === 1) {
+                    const { pair, forceLogical } = expandDateCond(conds[0]);
+                    for (const p of pair) {
+                        advConds.push({ operator: p.op, value: p.value } as unknown as IAdvancedFilterCondition);
+                        sigItems.push(p.sig);
+                    }
+                    if (forceLogical) colLogical = forceLogical;
                 } else {
-                    value = c.value;
+                    // 2 条件同居: eq/neq は単発でしか意味をなさないので除外、範囲演算子のみ採用
+                    for (const c of conds) {
+                        if (c.operator === "eq" || c.operator === "neq") continue;
+                        const { pair } = expandDateCond(c);
+                        for (const p of pair) {
+                            advConds.push({ operator: p.op, value: p.value } as unknown as IAdvancedFilterCondition);
+                            sigItems.push(p.sig);
+                        }
+                    }
                 }
-                advConds.push({ operator: op, value } as unknown as IAdvancedFilterCondition);
-                // シグネチャは列型に依存しないキー（YYYY-MM-DD or テキスト）
-                sigItems.push(`${op}:${c.value}`);
+            } else {
+                for (const c of conds) {
+                    const op = opMapText(c.operator);
+                    if (!op) continue;
+                    advConds.push({ operator: op, value: c.value } as unknown as IAdvancedFilterCondition);
+                    sigItems.push(`${op}:${c.value}`);
+                }
             }
             if (advConds.length === 0) continue;
 
-            filters.push(new AdvancedFilter(target, logicalOperator, ...advConds));
+            filters.push(new AdvancedFilter(target, colLogical, ...advConds));
             const condSig = sigItems.slice().sort().join(",");
-            sigParts.push(`${target.table}\0${target.column}\0${logicalOperator}\0${condSig}`);
+            sigParts.push(`${target.table}\0${target.column}\0${colLogical}\0${condSig}`);
         }
 
         if (filters.length === 0) return;
