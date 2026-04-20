@@ -23,31 +23,14 @@ import VisualDataChangeOperationKind = powerbi.VisualDataChangeOperationKind;
 import DataViewTable               = powerbi.DataViewTable;
 
 import { VisualFormattingSettingsModel } from "./settings";
+import {
+    FilterOp, FilterCondition, PrimitiveValue, FilterValue, ColumnType, TableData,
+    normalizeValue, formatDateUTC, toDateEpochFromString, toDateEpoch,
+    isConditionActive, filterSignature, buildFilterTarget,
+} from "./filterEngine";
 
 const ROW_H  = 24;   // px（tbody 行の高さ）
 const BUFFER = 8;    // ビューポート外に余分に描画しておく行数
-
-type TextOp = "contains" | "notContains";
-type DateOp = "eq" | "neq" | "lt" | "gt" | "lte" | "gte";
-type FilterOp = TextOp | DateOp;
-
-interface FilterCondition {
-    columnIndex: number;
-    operator: FilterOp;
-    value: string; // 日付条件は "YYYY-MM-DD" 固定、テキストは任意
-}
-
-type PrimitiveValue = string | number | boolean | Date | null;
-type FilterValue = string | number | boolean | Date;
-
-type ColumnType = "date" | "text";
-
-interface TableData {
-    columns: string[];
-    rows: string[][];
-    rawRows: PrimitiveValue[][]; // BasicFilter 用に型を保ったまま保持（Date 含む）
-    types: ColumnType[];         // 列型（date/text）: UI 分岐と演算子マップに使用
-}
 
 export class Visual implements IVisual {
     private host: IVisualHost;
@@ -98,6 +81,7 @@ export class Visual implements IVisual {
     private lastClickedRi = -1;                        // Shift+クリック用の起点行
     private calendarOverlay: HTMLElement;               // カレンダーポップアップ（position:fixed 1 個を使い回す）
     private activeCalendarIdx = -1;                     // 現在開いているカレンダーの条件 index（-1=閉）
+    private activeCalendarAnchor: HTMLInputElement | null = null; // ARIA 同期用
 
     constructor(options: VisualConstructorOptions) {
         this.host = options.host;
@@ -127,6 +111,8 @@ export class Visual implements IVisual {
         // カレンダーオーバーレイ（fixed 配置で overflow:hidden を回避）
         this.calendarOverlay = this.el("div", "date-calendar-overlay");
         this.calendarOverlay.style.display = "none";
+        this.calendarOverlay.setAttribute("role", "dialog");
+        this.calendarOverlay.setAttribute("aria-label", "日付選択カレンダー");
 
         [this.filterPanel, this.colToggleBar, this.statusBar, this.tableWrapper, this.calendarOverlay]
             .forEach(e => root.appendChild(e));
@@ -136,6 +122,15 @@ export class Visual implements IVisual {
             if (this.calendarOverlay.style.display !== "none"
                 && !this.calendarOverlay.contains(e.target as Node)) {
                 this.closeCalendar();
+            }
+        });
+        // ESC でカレンダーを閉じる（WCAG 対応）。anchor にフォーカスを戻す
+        root.addEventListener("keydown", (e) => {
+            if (e.key === "Escape" && this.calendarOverlay.style.display !== "none") {
+                const anchor = this.activeCalendarAnchor;
+                this.closeCalendar();
+                anchor?.focus();
+                e.stopPropagation();
             }
         });
 
@@ -208,14 +203,13 @@ export class Visual implements IVisual {
         // 読み込み中の中間チャンク
         if (isSegment && this.isLoadingMore) {
             this.runFilter();
-            const hasActiveSearch = this.appliedConditions.some(c => this.isConditionActive(c));
-            if (hasActiveSearch) {
-                this.filteredOrigIdx.forEach(i => this.selectedOrigIdx.add(i));
-                // AdvancedFilter 経路なら全行列挙不要 → 初回チャンクで即時発火して他ページへ反映
-                if (!this.advFilterEmitted && this.canUseAdvancedFilter() && this.selectedOrigIdx.size > 0) {
-                    this.applyDatasetFilter();
-                    this.advFilterEmitted = true;
-                }
+            const hasActiveSearch = this.appliedConditions.some(c => isConditionActive(c, this.tableData.types));
+            // AdvancedFilter 経路は全件条件評価なので、途中チャンクで即発火して他ページへ反映。
+            // selectedOrigIdx は触らない（中間の不完全な行集合でページ内 SelectionManager を
+            // 絞ると瞬間的な表示ブレが起きるため）。
+            if (hasActiveSearch && !this.advFilterEmitted && this.canUseAdvancedFilter()) {
+                this.emitAdvancedFilterForSync();
+                this.advFilterEmitted = true;
             }
             // 中間チャンクは描画を抑制（ステータスのみ更新）。最終チャンクで一括レンダリング。
             this.renderStatus();
@@ -224,11 +218,12 @@ export class Visual implements IVisual {
         // 最終チャンク完了後: 蓄積した検索ヒットをフィルターとして適用
         if (isSegment && !this.isLoadingMore) {
             this.runFilter();
-            const hasActiveSearch = this.appliedConditions.some(c => this.isConditionActive(c));
+            const hasActiveSearch = this.appliedConditions.some(c => isConditionActive(c, this.tableData.types));
             if (hasActiveSearch) {
+                // 最終チャンクで全件揃ったので selectedOrigIdx を確定させる
                 this.filteredOrigIdx.forEach(i => this.selectedOrigIdx.add(i));
+                this.applyDatasetFilter();
             }
-            if (this.selectedOrigIdx.size > 0) this.applyDatasetFilter();
             this.advFilterEmitted = false; // 次の検索に備えてリセット
         }
 
@@ -244,6 +239,14 @@ export class Visual implements IVisual {
             this.lastClickedRi = -1;
             this.conditions = [];
             this.appliedConditions = [];
+            // 列構成が変わったらフィルタ経路フラグをリセット。
+            // lastFilterJson が残っていると次回同一 signature の remove が「エコー扱い」で skip される
+            this.lastFilterJson = "";
+            this.lastFilterMode = null;
+            this.advFilterEmitted = false;
+            // 既存フィルタを明示的に解除（次の emit が発火できるように）
+            if (this.hasAppliedFilter) this.removeFilter();
+            this.selectedOrigIdx.clear();
         }
 
         // --- 状態復元（初回 or 列構成変化時のみ）---
@@ -344,13 +347,13 @@ export class Visual implements IVisual {
     private cellToString(v: PrimitiveValue, colType: ColumnType): string {
         if (v == null) return "";
         if (colType === "date") {
-            if (v instanceof Date) return this.formatDateUTC(v);
+            if (v instanceof Date) return formatDateUTC(v);
             // PBI が ISO 文字列で渡すケース: "2014-01-01T15:00:00.000Z" → "2014-01-01"
             if (typeof v === "string") {
                 const m = String(v).match(/^(\d{4})-(\d{2})-(\d{2})/);
                 if (m) return `${m[1]}-${m[2]}-${m[3]}`;
                 const d = new Date(v);
-                if (!isNaN(d.getTime())) return this.formatDateUTC(d);
+                if (!isNaN(d.getTime())) return formatDateUTC(d);
             }
         }
         return String(v);
@@ -412,7 +415,7 @@ export class Visual implements IVisual {
         for (const v of ["AND", "OR"] as const) {
             const b = this.el("button", "logic-btn" + (this.logic === v ? " active" : ""));
             b.textContent = v;
-            b.onclick = () => { this.logic = v; this.persist(); this.renderFilterPanel(); };
+            b.onclick = () => { this.logic = v; this.debounceSave(); this.renderFilterPanel(); };
             tog.appendChild(b);
         }
         hdr.appendChild(tog);
@@ -441,7 +444,7 @@ export class Visual implements IVisual {
             if (addBtn.disabled) return;
             const defOp: FilterOp = (this.tableData.types[availableCol] === "date") ? "eq" : "contains";
             this.conditions.push({ columnIndex: availableCol, operator: defOp, value: "" });
-            this.persist(); this.renderFilterPanel();
+            this.debounceSave(); this.renderFilterPanel();
         };
 
         const clearBtn = this.el("button", "clear-btn") as HTMLButtonElement;
@@ -490,7 +493,7 @@ export class Visual implements IVisual {
                 this.conditions[idx].operator = (newType === "date") ? "eq" : "contains";
                 this.conditions[idx].value = "";
             }
-            this.persist(); this.renderFilterPanel();
+            this.debounceSave(); this.renderFilterPanel();
         };
 
         const opSel = this.el("select", "op-select");
@@ -515,7 +518,7 @@ export class Visual implements IVisual {
         }
         opSel.onchange = () => {
             this.conditions[idx].operator = opSel.value as FilterOp;
-            this.persist();
+            this.debounceSave();
         };
 
         let valueEl: HTMLElement;
@@ -525,11 +528,23 @@ export class Visual implements IVisual {
             inp.type = "text"; inp.readOnly = true;
             inp.placeholder = "📅 日付を選択";
             inp.value = cond.value || "";
+            // ARIA: スクリーンリーダーにカレンダー起動可能であることを伝える
+            inp.setAttribute("role", "combobox");
+            inp.setAttribute("aria-haspopup", "dialog");
+            inp.setAttribute("aria-expanded", "false");
+            inp.setAttribute("aria-label", "日付を選択");
             // mousedown も止めないと、root の outside-click handler が先に発火して
             // 直後の click での toggle close が「close → open」に化ける（Bug 1）
             inp.onmousedown = (e) => e.stopPropagation();
             inp.onclick = (e) => { e.stopPropagation(); this.showCalendar(inp, cond, idx); };
-            inp.onkeydown = (e: KeyboardEvent) => { if (e.key === "Enter") this.executeSearch(); };
+            inp.onkeydown = (e: KeyboardEvent) => {
+                if (e.key === "Enter") { this.executeSearch(); return; }
+                // Space / ArrowDown でもカレンダーを開く（キーボード操作）
+                if (e.key === " " || e.key === "ArrowDown") {
+                    e.preventDefault();
+                    this.showCalendar(inp, cond, idx);
+                }
+            };
             valueEl = inp;
         } else {
             const inp = this.el("input", "value-input") as HTMLInputElement;
@@ -542,7 +557,7 @@ export class Visual implements IVisual {
         }
 
         const del = this.el("button", "remove-btn"); del.textContent = "×";
-        del.onclick = () => { this.conditions.splice(idx, 1); this.persist(); this.renderFilterPanel(); };
+        del.onclick = () => { this.conditions.splice(idx, 1); this.debounceSave(); this.renderFilterPanel(); };
 
         row.appendChild(colSel); row.appendChild(opSel); row.appendChild(valueEl); row.appendChild(del);
         return row;
@@ -558,11 +573,21 @@ export class Visual implements IVisual {
     private closeCalendar(): void {
         this.calendarOverlay.style.display = "none";
         this.activeCalendarIdx = -1;
+        if (this.activeCalendarAnchor) {
+            this.activeCalendarAnchor.setAttribute("aria-expanded", "false");
+            this.activeCalendarAnchor = null;
+        }
     }
 
     private showCalendar(anchor: HTMLInputElement, cond: FilterCondition, idx: number): void {
         if (this.activeCalendarIdx === idx) { this.closeCalendar(); return; }
+        // 別の input から切替える場合は、前の anchor の aria-expanded を戻す
+        if (this.activeCalendarAnchor && this.activeCalendarAnchor !== anchor) {
+            this.activeCalendarAnchor.setAttribute("aria-expanded", "false");
+        }
         this.activeCalendarIdx = idx;
+        this.activeCalendarAnchor = anchor;
+        anchor.setAttribute("aria-expanded", "true");
 
         const rect = anchor.getBoundingClientRect();
         const overlay = this.calendarOverlay;
@@ -663,7 +688,7 @@ export class Visual implements IVisual {
                     this.conditions[idx].value = dateStr;
                     anchor.value = dateStr;
                     this.closeCalendar();
-                    this.persist();
+                    this.debounceSave();
                 };
                 grid.appendChild(btn);
             }
@@ -730,7 +755,7 @@ export class Visual implements IVisual {
 
         this.runFilter();
 
-        const hasActiveSearch = this.appliedConditions.some(c => this.isConditionActive(c));
+        const hasActiveSearch = this.appliedConditions.some(c => isConditionActive(c, this.tableData.types));
 
         // 検索結果がある場合、全結果行を自動選択してクロスフィルター適用
         if (hasActiveSearch && this.filteredRows.length > 0) {
@@ -750,7 +775,7 @@ export class Visual implements IVisual {
     }
 
     private runFilter(): void {
-        const active = this.appliedConditions.filter(c => this.isConditionActive(c));
+        const active = this.appliedConditions.filter(c => isConditionActive(c, this.tableData.types));
         this.filteredRows = []; this.filteredOrigIdx = [];
 
         if (active.length === 0) {
@@ -772,7 +797,7 @@ export class Visual implements IVisual {
                 cond: c,
                 kind: isDate ? "date" : "text",
                 keyword: isDate ? "" : c.value.toLowerCase(),
-                valueEpoch: isDate ? this.toDateEpochFromString(c.value.trim()) : NaN,
+                valueEpoch: isDate ? toDateEpochFromString(c.value.trim()) : NaN,
             };
         });
 
@@ -785,7 +810,7 @@ export class Visual implements IVisual {
             }
             // date: rawRows から Date を取り出し、時刻を 0:00 に丸めてローカル epoch 比較
             const raw = this.tableData.rawRows[oi]?.[p.cond.columnIndex];
-            const rowEp = this.toDateEpoch(raw);
+            const rowEp = toDateEpoch(raw);
             if (isNaN(p.valueEpoch)) return false; // 入力が不正ならマッチしない
             if (isNaN(rowEp)) {
                 // SQL 三値論理に合わせ、null/非 Date 行は全演算子で不一致扱い
@@ -1086,7 +1111,7 @@ export class Visual implements IVisual {
      * - 同一列 3 条件以上: false（API 仕様で 1 列 2 条件まで。UI 側で制限しているが永続化復元の保険）
      */
     private canUseAdvancedFilter(): boolean {
-        const active = this.appliedConditions.filter(c => this.isConditionActive(c));
+        const active = this.appliedConditions.filter(c => isConditionActive(c, this.tableData.types));
         if (active.length === 0) return false;
 
         const byCol = new Map<number, number>();
@@ -1103,7 +1128,7 @@ export class Visual implements IVisual {
         const dv = this.lastDataView;
         if (!dv?.table?.columns?.length) return;
 
-        const active = this.appliedConditions.filter(c => this.isConditionActive(c));
+        const active = this.appliedConditions.filter(c => isConditionActive(c, this.tableData.types));
         if (active.length === 0) return;
 
         // 列ごとにグループ化
@@ -1140,7 +1165,7 @@ export class Visual implements IVisual {
         for (const [ci, conds] of byCol) {
             const col = cols[ci];
             if (!col) continue;
-            const target = this.buildFilterTarget(col);
+            const target = buildFilterTarget(col);
             if (!target) continue;
 
             const colType: ColumnType = this.tableData.types[ci] ?? "text";
@@ -1150,9 +1175,14 @@ export class Visual implements IVisual {
                 const op = opMapOut(colType, c.operator);
                 if (!op) continue;
                 // 日付は UTC midnight の Date で渡す（powerbi-models は型定義上 string|number|boolean だが実行時 Date も受理）
-                const value: string | number | boolean | Date = (colType === "date")
-                    ? (() => { const [y, m, d] = c.value.split("-").map(Number); return new Date(Date.UTC(y, m - 1, d)); })()
-                    : c.value;
+                let value: string | number | boolean | Date;
+                if (colType === "date") {
+                    const epoch = toDateEpochFromString(c.value);
+                    if (!Number.isFinite(epoch)) continue; // 不正日付文字列は skip
+                    value = new Date(epoch);
+                } else {
+                    value = c.value;
+                }
                 advConds.push({ operator: op, value } as unknown as IAdvancedFilterCondition);
                 // シグネチャは列型に依存しないキー（YYYY-MM-DD or テキスト）
                 sigItems.push(`${op}:${c.value}`);
@@ -1191,7 +1221,7 @@ export class Visual implements IVisual {
         const sigParts: string[] = [];
 
         for (let ci = 0; ci < cols.length; ci++) {
-            const target = this.buildFilterTarget(cols[ci]);
+            const target = buildFilterTarget(cols[ci]);
             if (!target) continue;
 
             // 正規化キーで重複排除しつつ、BasicFilter には raw（Date 含む）を渡す
@@ -1199,7 +1229,7 @@ export class Visual implements IVisual {
             for (const i of selArr) {
                 const raw = this.tableData.rawRows[i]?.[ci];
                 if (raw == null || raw === "") continue;
-                const key = this.normalizeValue(raw);
+                const key = normalizeValue(raw);
                 if (!valueMap.has(key)) valueMap.set(key, raw as FilterValue);
             }
             if (valueMap.size === 0) continue;
@@ -1207,7 +1237,7 @@ export class Visual implements IVisual {
             // powerbi-models の型は Date を受け付けないが、実行時は受理される
             const rawValues = Array.from(valueMap.values()) as (string | number | boolean)[];
             filters.push(new BasicFilter(target, "In", ...rawValues));
-            sigParts.push(this.filterSignature(target, Array.from(valueMap.keys())));
+            sigParts.push(filterSignature(target, Array.from(valueMap.keys())));
         }
 
         if (filters.length === 0) return;
@@ -1223,89 +1253,6 @@ export class Visual implements IVisual {
         this.lastFilterJson = key;
         this.lastFilterMode = "BASIC";
         this.host.applyJsonFilter(filters, "general", "filter", FilterAction.merge);
-    }
-
-    /** 比較用の正規キー（Date は ISO、その他は String） */
-    private normalizeValue(v: unknown): string {
-        if (v instanceof Date) return v.toISOString();
-        if (typeof v === "string" && /^\d{4}-\d{2}-\d{2}T/.test(v)) {
-            // Power BI が jsonFilters で ISO 文字列化した Date を受け取るケース
-            const d = new Date(v);
-            if (!isNaN(d.getTime())) return d.toISOString();
-        }
-        return String(v);
-    }
-
-    // ==========================================================
-    // 日付ユーティリティ（すべて UTC 基準で動作）
-    // Power BI は日時値を UTC epoch の Date オブジェクト（or ISO 文字列）
-    // で渡す。getUTCFullYear/Month/Date で日付部分を取り出すことで、
-    // JST 等のローカル TZ による日付ズレを回避する。
-    // ==========================================================
-
-    /**
-     * Date → "YYYY-MM-DD"（UTC の年月日）。
-     * Power BI は日時値を UTC epoch で渡すため、
-     * getUTCFullYear/Month/Date で日付部分を取り出す。
-     */
-    private formatDateUTC(d: Date): string {
-        const y = d.getUTCFullYear();
-        const m = String(d.getUTCMonth() + 1).padStart(2, "0");
-        const day = String(d.getUTCDate()).padStart(2, "0");
-        return `${y}-${m}-${day}`;
-    }
-
-    /** "YYYY-MM-DD" → UTC 0:00 の epoch。不正値は NaN */
-    private toDateEpochFromString(s: string): number {
-        if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return NaN;
-        const [y, m, d] = s.split("-").map(Number);
-        return Date.UTC(y, m - 1, d);
-    }
-
-    /**
-     * 行の値 → UTC 0:00 epoch（時刻部分を切り捨て）。
-     * PBI が Date オブジェクトではなく ISO 文字列で渡すケースにも対応。
-     */
-    private toDateEpoch(v: unknown): number {
-        if (v instanceof Date) {
-            return Date.UTC(v.getUTCFullYear(), v.getUTCMonth(), v.getUTCDate());
-        }
-        if (typeof v === "string") {
-            const m = v.match(/^(\d{4})-(\d{2})-(\d{2})/);
-            if (m) return Date.UTC(+m[1], +m[2] - 1, +m[3]);
-        }
-        return NaN;
-    }
-
-    /** 条件が「検索に寄与するアクティブな条件」か共通判定 */
-    private isConditionActive(c: FilterCondition): boolean {
-        const v = c.value.trim();
-        if (v === "") return false;
-        if (this.tableData.types[c.columnIndex] === "date") {
-            return /^\d{4}-\d{2}-\d{2}$/.test(v);
-        }
-        return true;
-    }
-
-    /** target + 正規化済みキー配列の比較キー（toJSON の差異を回避） */
-    private filterSignature(target: IFilterColumnTarget, normalizedKeys: string[]): string {
-        const sorted = normalizedKeys.slice().sort();
-        return `${target.table}\0${target.column}\0${sorted.join("\0")}`;
-    }
-
-    private buildFilterTarget(col: powerbi.DataViewMetadataColumn): IFilterColumnTarget | null {
-        if (!col?.queryName) return null;
-        let qn = col.queryName;
-        // 集計ラッパー "Sum(Table.Column)" 等を剥がして元列を特定
-        const aggMatch = qn.match(/^\w+\((.+)\)$/);
-        const hasAgg = !!aggMatch;
-        if (hasAgg) qn = aggMatch[1];
-        // ラッパー無しかつ isMeasure は DAX メジャーなど元列不明 → 対象外
-        if (!hasAgg && col.isMeasure) return null;
-        const dotIdx = qn.indexOf(".");
-        if (dotIdx < 1) return null;
-        // 常に queryName 側の列名を使う（displayName はユーザーリネームでズレる）
-        return { table: qn.substring(0, dotIdx), column: qn.substring(dotIdx + 1) };
     }
 
     private removeFilter(): void {
@@ -1353,16 +1300,16 @@ export class Visual implements IVisual {
 
             let colIdx = -1;
             for (let i = 0; i < cols.length; i++) {
-                const t = this.buildFilterTarget(cols[i]);
+                const t = buildFilterTarget(cols[i]);
                 if (t && t.table === tgt.table && t.column === tgt.column) { colIdx = i; break; }
             }
             if (colIdx < 0) continue;
 
-            const normalized = values.map(v => this.normalizeValue(v));
+            const normalized = values.map(v => normalizeValue(v));
             parsed.push({
                 colIdx,
                 valueSet: new Set(normalized),
-                sig: this.filterSignature(tgt, normalized),
+                sig: filterSignature(tgt, normalized),
             });
         }
         if (parsed.length === 0) return false;
@@ -1376,7 +1323,7 @@ export class Visual implements IVisual {
             for (const p of parsed) {
                 const raw = row[p.colIdx];
                 if (raw == null) return;
-                if (!p.valueSet.has(this.normalizeValue(raw))) return;
+                if (!p.valueSet.has(normalizeValue(raw))) return;
             }
             matched.add(i);
         });
@@ -1443,7 +1390,7 @@ export class Visual implements IVisual {
 
             let colIdx = -1;
             for (let i = 0; i < cols.length; i++) {
-                const t = this.buildFilterTarget(cols[i]);
+                const t = buildFilterTarget(cols[i]);
                 if (t && t.table === tgt.table && t.column === tgt.column) { colIdx = i; break; }
             }
             if (colIdx < 0) continue;
@@ -1493,20 +1440,29 @@ export class Visual implements IVisual {
             }
         }
 
-        this.conditions       = newConds.map(c => ({ ...c }));
+        // 編集中の UI 状態（this.conditions / this.logic）は上書きしない。
+        // ユーザーが条件入力中に他ビジュアルからの同期が飛んできても入力が消えないように、
+        // 「適用済み」側 (appliedConditions / appliedLogic) のみ同期する。
+        // ただし UI が空（未タッチ）の場合は UI にも同期してユーザーに見せる。
+        const uiIsEmpty = this.conditions.length === 0
+            || this.conditions.every(c => !isConditionActive(c, this.tableData.types));
+        if (uiIsEmpty) {
+            this.conditions = newConds.map(c => ({ ...c }));
+            this.logic      = globalLogic;
+        }
         this.appliedConditions = newConds;
-        this.appliedLogic     = globalLogic;
-        this.logic            = globalLogic;
+        this.appliedLogic      = globalLogic;
 
         // ローカル表示用にもフィルタを適用し、一致行を selection に反映
         this.runFilter();
         const matched = new Set<number>(this.filteredOrigIdx);
 
-        // 一致 0 件は未ロード等の可能性があるので selection は破壊せず、条件 UI 復元だけ確定する
+        // 一致 0 件は未ロード等の可能性があるので selection は破壊せず、
+        // lastFilterJson も更新しない（次回データが揃った時の再マッチを許す）。
+        if (matched.size === 0) return true;
+
         this.lastFilterJson = incomingKey;
         this.lastFilterMode = "ADV";
-
-        if (matched.size === 0) return true;
 
         this.selectedOrigIdx = matched;
         const ids = Array.from(this.selectedOrigIdx)
