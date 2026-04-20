@@ -1051,7 +1051,8 @@ export class Visual implements IVisual {
         this.applyDatasetFilter();
         this.updateSelectionUI();
         this.renderStatus();
-        requestAnimationFrame(() => this.persist());
+        // 行選択は persistProperties には保存しない（真実源は applyJsonFilter / jsonFilters）。
+        // ここで persist() は呼ばない。条件変更は commitSelection を経由しない別経路で persist される。
     }
 
     private applyDatasetFilter(): void {
@@ -1381,7 +1382,8 @@ export class Visual implements IVisual {
         });
 
         // 一致ゼロ = 現在のウィンドウに該当行が無いだけの可能性が高い。
-        // 永続化された選択を破壊しないよう early return（lastFilterJson も更新しない）。
+        // 現セッションの行選択 (selectedOrigIdx) を破壊しないよう early return
+        // （lastFilterJson も更新しない）。
         if (matched.size === 0) return false;
 
         this.selectedOrigIdx = matched;
