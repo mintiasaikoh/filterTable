@@ -247,19 +247,17 @@ export class Visual implements IVisual {
         }
 
         // --- 状態復元（初回 or 列構成変化時のみ）---
+        // 行選択は永続化しないので restoreState は conditions のみ復元する。
+        // 真実源は options.jsonFilters に一本化されているので、restoreFromJsonFilters で
+        // 行選択（selectedOrigIdx）を毎回再構築する（ChicletSlicer パターン）。
         const isFirstLoad = !this.hasInteracted;
         if (isFirstLoad || colsChanged) {
             this.restoreState(dv);
-            // 永続化された選択があれば、実際に下流へフィルターを流し直す
-            if (this.selectedOrigIdx.size > 0) {
-                this.applyDatasetFilter();
-            }
         }
 
-        // 外部スライサーからの BasicFilter を検出 → 選択に反映（自己発火のエコーは除外）
-        // 初回ロードでも、永続化された選択がなければ slicer filter を優先
-        const hasPersistedSelection = this.selectedOrigIdx.size > 0;
-        if (!colsChanged && (!isFirstLoad || !hasPersistedSelection)) {
+        // 列構成が変わっていなければ常に jsonFilters から行選択を再構築。
+        // 自己発火分は restoreFromJsonFilters 内の signature チェックで除外される。
+        if (!colsChanged) {
             this.restoreFromJsonFilters(options.jsonFilters, dv);
         }
 
@@ -331,14 +329,11 @@ export class Visual implements IVisual {
         catch { this.appliedConditions = []; }
         this.appliedLogic = (m?.["appliedLogic"] as string) === "OR" ? "OR" : "AND";
 
-        // 選択インデックスの復元（hasAppliedFilter は実際に applyDatasetFilter した時点で立てる）
-        try {
-            const idxStr = m?.["selectionIdx"] as string;
-            const idxArr: number[] = idxStr ? JSON.parse(idxStr) : [];
-            if (idxArr.length > 0) {
-                this.selectedOrigIdx = new Set(idxArr.filter(i => i >= 0 && i < this.tableData.rows.length));
-            }
-        } catch { /* 復元失敗時は空のまま */ }
+        // 行選択 (selectedOrigIdx) はここで復元しない。
+        // 真実源は applyJsonFilter / options.jsonFilters 側に一本化しており、
+        // restoreFromJsonFilters() が外部受信経路で自然に再構築する（ChicletSlicer パターン）。
+        // 行 index を persistProperties({selector:null}) に保存するとレポート全体共有となり、
+        // RLS で可視行集合が異なるユーザー間で意味が壊れるため廃止した。
     }
 
     /**
@@ -348,7 +343,16 @@ export class Visual implements IVisual {
      */
     private cellToString(v: PrimitiveValue, colType: ColumnType): string {
         if (v == null) return "";
-        if (colType === "date" && v instanceof Date) return this.formatLocalDate(v);
+        if (colType === "date") {
+            if (v instanceof Date) return this.formatDateUTC(v);
+            // PBI が ISO 文字列で渡すケース: "2014-01-01T15:00:00.000Z" → "2014-01-01"
+            if (typeof v === "string") {
+                const m = String(v).match(/^(\d{4})-(\d{2})-(\d{2})/);
+                if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+                const d = new Date(v);
+                if (!isNaN(d.getTime())) return this.formatDateUTC(d);
+            }
+        }
         return String(v);
     }
 
@@ -521,6 +525,9 @@ export class Visual implements IVisual {
             inp.type = "text"; inp.readOnly = true;
             inp.placeholder = "📅 日付を選択";
             inp.value = cond.value || "";
+            // mousedown も止めないと、root の outside-click handler が先に発火して
+            // 直後の click での toggle close が「close → open」に化ける（Bug 1）
+            inp.onmousedown = (e) => e.stopPropagation();
             inp.onclick = (e) => { e.stopPropagation(); this.showCalendar(inp, cond, idx); };
             inp.onkeydown = (e: KeyboardEvent) => { if (e.key === "Enter") this.executeSearch(); };
             valueEl = inp;
@@ -559,37 +566,44 @@ export class Visual implements IVisual {
 
         const rect = anchor.getBoundingClientRect();
         const overlay = this.calendarOverlay;
+        // 測定中は非表示にして、旧 top/left 位置での一瞬表示（フリッカー）を防ぐ
+        overlay.style.visibility = "hidden";
         overlay.style.display = "block";
-        overlay.style.left = rect.left + "px";
 
         // 描画後にサイズを取得して下か上か決める
         this.renderCalendarContent(cond, idx, anchor);
         const oh = overlay.offsetHeight;
         const spaceBelow = window.innerHeight - rect.bottom;
+        overlay.style.left = rect.left + "px";
         overlay.style.top = (spaceBelow >= oh + 4)
             ? (rect.bottom + 2) + "px"   // 下に余裕がある → 下向き
             : (rect.top - oh - 2) + "px"; // 上向き
+        overlay.style.visibility = "visible";
     }
 
     private renderCalendarContent(cond: FilterCondition, idx: number, anchor: HTMLInputElement): void {
         const overlay = this.calendarOverlay;
         this.clear(overlay);
 
-        let displayDate: Date;
-        if (cond.value && /^\d{4}-\d{2}-\d{2}$/.test(cond.value)) {
-            displayDate = new Date(cond.value + "T00:00:00");
+        // 選択済みの値から初期表示月を決定（Date 変換せず直接パース）
+        let viewYear: number, viewMonth: number;
+        const valMatch = cond.value?.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+        if (valMatch) {
+            viewYear = +valMatch[1];
+            viewMonth = +valMatch[2] - 1;
         } else {
-            displayDate = new Date();
+            const now = new Date();
+            viewYear = now.getFullYear();
+            viewMonth = now.getMonth();
         }
-        let viewYear = displayDate.getFullYear();
-        let viewMonth = displayDate.getMonth();
 
         const render = () => {
             this.clear(overlay);
 
             // ---- ヘッダー: ◀  2026年4月  ▶ ----
             const header = this.el("div", "cal-header");
-            const prev = this.el("button", "cal-nav");
+            const prev = this.el("button", "cal-nav") as HTMLButtonElement;
+            prev.type = "button";
             prev.textContent = "◀";
             prev.onclick = (e) => {
                 e.stopPropagation(); viewMonth--;
@@ -598,7 +612,8 @@ export class Visual implements IVisual {
             };
             const title = this.el("span", "cal-title");
             title.textContent = `${viewYear}年${viewMonth + 1}月`;
-            const next = this.el("button", "cal-nav");
+            const next = this.el("button", "cal-nav") as HTMLButtonElement;
+            next.type = "button";
             next.textContent = "▶";
             next.onclick = (e) => {
                 e.stopPropagation(); viewMonth++;
@@ -623,17 +638,22 @@ export class Visual implements IVisual {
             const grid = this.el("div", "cal-grid");
             const firstDow = new Date(viewYear, viewMonth, 1).getDay();
             const daysInMonth = new Date(viewYear, viewMonth + 1, 0).getDate();
+            const pad2 = (n: number) => String(n).padStart(2, "0");
 
             for (let i = 0; i < firstDow; i++) {
                 grid.appendChild(this.el("span", "cal-cell cal-empty"));
             }
 
-            const todayStr = this.formatLocalDate(new Date());
+            // today はユーザーのローカル TZ（直観と一致させるため）
+            const now = new Date();
+            const todayStr = `${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())}`;
             const selectedStr = cond.value;
 
             for (let d = 1; d <= daysInMonth; d++) {
-                const dateStr = this.formatLocalDate(new Date(viewYear, viewMonth, d));
+                // カレンダーは純粋な暦 → TZ 変換不要、直接文字列生成
+                const dateStr = `${viewYear}-${pad2(viewMonth + 1)}-${pad2(d)}`;
                 const btn = this.el("button", "cal-cell") as HTMLButtonElement;
+                btn.type = "button";
                 btn.textContent = String(d);
                 if (dateStr === selectedStr) btn.classList.add("cal-selected");
                 if (dateStr === todayStr) btn.classList.add("cal-today");
@@ -765,7 +785,7 @@ export class Visual implements IVisual {
             }
             // date: rawRows から Date を取り出し、時刻を 0:00 に丸めてローカル epoch 比較
             const raw = this.tableData.rawRows[oi]?.[p.cond.columnIndex];
-            const rowEp = this.toLocalDateEpoch(raw);
+            const rowEp = this.toDateEpoch(raw);
             if (isNaN(p.valueEpoch)) return false; // 入力が不正ならマッチしない
             if (isNaN(rowEp)) {
                 // SQL 三値論理に合わせ、null/非 Date 行は全演算子で不一致扱い
@@ -1128,9 +1148,9 @@ export class Visual implements IVisual {
             for (const c of conds) {
                 const op = opMapOut(colType, c.operator);
                 if (!op) continue;
-                // 日付は Date オブジェクトで渡す（powerbi-models は型定義上 string|number|boolean のみだが実行時 Date も受理）
+                // 日付は UTC midnight の Date で渡す（powerbi-models は型定義上 string|number|boolean だが実行時 Date も受理）
                 const value: string | number | boolean | Date = (colType === "date")
-                    ? new Date(c.value + "T00:00:00")
+                    ? (() => { const [y, m, d] = c.value.split("-").map(Number); return new Date(Date.UTC(y, m - 1, d)); })()
                     : c.value;
                 advConds.push({ operator: op, value } as unknown as IAdvancedFilterCondition);
                 // シグネチャは列型に依存しないキー（YYYY-MM-DD or テキスト）
@@ -1216,34 +1236,44 @@ export class Visual implements IVisual {
     }
 
     // ==========================================================
-    // 日付ユーティリティ（すべてシステムのローカルタイム基準で動作）
-    // Power BI が渡す Date はモデル上 UTC ベースだが、ユーザーが
-    // ビジュアル上で見る「日付」は必ず実行環境の TZ（例: JST）に
-    // 合わせる。getFullYear/Month/Date はシステム TZ で解釈されるので
-    // そのまま利用する（Intl.DateTimeFormat に委ねてもよいが、
-    // フォーマットは locale-neutral な YYYY-MM-DD で統一する）。
+    // 日付ユーティリティ（すべて UTC 基準で動作）
+    // Power BI は日時値を UTC epoch の Date オブジェクト（or ISO 文字列）
+    // で渡す。getUTCFullYear/Month/Date で日付部分を取り出すことで、
+    // JST 等のローカル TZ による日付ズレを回避する。
     // ==========================================================
 
-    /** Date → "YYYY-MM-DD"（ローカルタイムの年月日） */
-    private formatLocalDate(d: Date): string {
-        const y = d.getFullYear();
-        const m = String(d.getMonth() + 1).padStart(2, "0");
-        const day = String(d.getDate()).padStart(2, "0");
+    /**
+     * Date → "YYYY-MM-DD"（UTC の年月日）。
+     * Power BI は日時値を UTC epoch で渡すため、
+     * getUTCFullYear/Month/Date で日付部分を取り出す。
+     */
+    private formatDateUTC(d: Date): string {
+        const y = d.getUTCFullYear();
+        const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+        const day = String(d.getUTCDate()).padStart(2, "0");
         return `${y}-${m}-${day}`;
     }
 
-    /** "YYYY-MM-DD" → ローカル 0:00 の epoch。不正値は NaN */
+    /** "YYYY-MM-DD" → UTC 0:00 の epoch。不正値は NaN */
     private toDateEpochFromString(s: string): number {
         if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return NaN;
-        // "T00:00:00" を付けると実行環境のローカル TZ で解釈される
-        const d = new Date(s + "T00:00:00");
-        return isNaN(d.getTime()) ? NaN : d.getTime();
+        const [y, m, d] = s.split("-").map(Number);
+        return Date.UTC(y, m - 1, d);
     }
 
-    /** 行の値 → ローカル 0:00 epoch（時刻部分を切り捨て）。Date 以外は NaN */
-    private toLocalDateEpoch(v: unknown): number {
-        if (!(v instanceof Date)) return NaN;
-        return new Date(v.getFullYear(), v.getMonth(), v.getDate()).getTime();
+    /**
+     * 行の値 → UTC 0:00 epoch（時刻部分を切り捨て）。
+     * PBI が Date オブジェクトではなく ISO 文字列で渡すケースにも対応。
+     */
+    private toDateEpoch(v: unknown): number {
+        if (v instanceof Date) {
+            return Date.UTC(v.getUTCFullYear(), v.getUTCMonth(), v.getUTCDate());
+        }
+        if (typeof v === "string") {
+            const m = v.match(/^(\d{4})-(\d{2})-(\d{2})/);
+            if (m) return Date.UTC(+m[1], +m[2] - 1, +m[3]);
+        }
+        return NaN;
     }
 
     /** 条件が「検索に寄与するアクティブな条件」か共通判定 */
@@ -1621,11 +1651,11 @@ export class Visual implements IVisual {
 
     private persist(): void {
         this.hasInteracted = true;
-        const selIdx = this.selectedOrigIdx.size > 0 ? Array.from(this.selectedOrigIdx) : [];
+        // selectionIdx はレポート全体共有で RLS で壊れるため保存しない。
+        // 行選択は applyJsonFilter / options.jsonFilters 経由で自然に復元される（真実源一本化）。
         this.host.persistProperties({ merge: [{ objectName: "filterState", selector: null, properties: {
             conditions: JSON.stringify(this.conditions), logic: this.logic,
             applied: JSON.stringify(this.appliedConditions), appliedLogic: this.appliedLogic,
-            selectionIdx: JSON.stringify(selIdx),
         }}]});
     }
 

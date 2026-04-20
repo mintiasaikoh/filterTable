@@ -45,6 +45,21 @@ Codex will review your output once you are done
 4. **数値列の自動集計（Sum）を対象に含める**: `isMeasure=true` だけで弾くと Sale Price 等の数値列が BasicFilter から抜け落ち、他ページで絞り込めない。`queryName` が `Sum(Table.Col)` 形式なら中身を剥がして target にする。**column 名は常に queryName の後半を使う**（displayName はユーザーリネームでズレる）
 5. **日時列は Date オブジェクト**: `normalizeValue()` で ISO 文字列化して比較・signature 生成。`String(date)` はロケール依存で受信エコーが一致せず無限ループになる。`BasicFilter` には raw Date を渡す（型は `string|number|boolean[]` にキャストが必要）
 
+## RLS とセキュリティ
+
+本ビジュアルは Row-Level Security 有効環境で安全に動作することが前提。以下の原則を死守。
+
+1. **`persistProperties({ selector: null })` はレポート定義保存 = 全ユーザー共有**。ユーザー単位の永続化 API は Power BI に存在しない（`ILocalVisualStorageV2Service` は certified visual 限定で対象外）
+2. **永続化してよいもの**: ユーザーが書いたフィルター条件（`conditions` / `logic` / `applied` / `appliedLogic`）のみ
+3. **永続化してはいけないもの**:
+   - **行 index 配列** (`selectionIdx` 等): RLS / sort / incremental 読込で意味が崩壊
+   - **行の値サンプル / SelectionId シリアライズ**: レポートメタデータ経由で機密値が低権限ユーザーに露出しうる
+4. **真実源は `applyJsonFilter` / `options.jsonFilters` に一本化**（ChicletSlicer / Timeline パターン）。行選択のクロスセッション復元は `restoreFromJsonFilters()` が jsonFilters から自動で再構築する。`selectedOrigIdx` はセッション内の derived state
+5. **`applyJsonFilter` は RLS-safe**: モデル層で RLS と AND 結合される。バイパス経路にはならない（データ漏洩リスクなし）
+6. **PBIX 直接配布では RLS が効かない**。Service 公開を前提とする
+
+出典: `learn.microsoft.com/en-us/power-bi/developer/visuals/objects-properties`, `/local-storage`, `/power-bi/guidance/rls-guidance`, `microsoft/PowerBI-visuals-ChicletSlicer/src/webBehavior.ts:216-236`, `microsoft/powerbi-visuals-timeline/src/timeLine.ts:958-977`
+
 ## jsonFilters 受信
 
 - `options.jsonFilters` から取得（`dv.metadata.jsonFilters` は**存在しない**。型アサーションで誤魔化すと無言で壊れる）
@@ -93,13 +108,16 @@ interface TableData {
 ## 日時列のカレンダーフィルター
 
 - `dv.table.columns[i].type?.dateTime === true` の列は `types[i] === "date"` として扱う
-- フィルター UI では値入力を `<input type="date">`（カレンダー）にし、演算子は `eq/neq/gte/lte/gt/lt`（「と同じ」「以外」「以降」「以前」「より後」「より前」）
-- **日付単位で比較（時刻は無視）**: 行側は `new Date(y, m, d).getTime()`、入力側は `new Date("YYYY-MM-DD" + "T00:00:00").getTime()`。両者 0:00 に揃えて epoch 比較
+- フィルター UI では値入力をカスタムカレンダーポップアップにし、演算子は `eq/neq/gte/lte/gt/lt`（「と同じ」「以外」「以降」「以前」「より後」「より前」）
+- **すべて UTC 基準**: PBI は日時値を UTC epoch の Date で渡す。`getUTCFullYear/Month/Date` で日付部分を取り出す。ローカル TZ（JST 等）の `getDate()` を使うと日付が 1 日ズレるため禁止
+- **日付単位で比較（時刻は無視）**: 行側は `Date.UTC(getUTCFullYear, getUTCMonth, getUTCDate)`、入力側は `Date.UTC(y, m-1, d)`。両者 UTC 0:00 に揃えて epoch 比較
+- **文字列値にも対応**: PBI が ISO 文字列（`"2014-01-01T15:00:00.000Z"`）で渡すケースがある。`toDateEpoch` / `cellToString` で先頭 10 文字を正規表現抽出して処理
 - **範囲指定**: 同一列に `gte YYYY-MM-DD` + `lte YYYY-MM-DD` の 2 条件で表現（1 列 2 条件制限の範囲内）
-- **AdvancedFilter マップ**: `eq→Is` / `neq→IsNot` / `lt→LessThan` / `lte→LessThanOrEqual` / `gt→GreaterThan` / `gte→GreaterThanOrEqual`。値は `Date` オブジェクトで渡す（powerbi-models の型は `string|number|boolean` だが実行時 Date 受理。キャストが必要）
+- **AdvancedFilter マップ**: `eq→Is` / `neq→IsNot` / `lt→LessThan` / `lte→LessThanOrEqual` / `gt→GreaterThan` / `gte→GreaterThanOrEqual`。値は UTC midnight の `Date` オブジェクトで渡す（`Date.UTC(y, m-1, d)` で生成。powerbi-models の型は `string|number|boolean` だが実行時 Date 受理。キャストが必要）
 - **エコー signature**: 値は `YYYY-MM-DD` 表記で統一（ISO 時刻込みは不安定）
 - **列型変更時のリセット**: 条件行で列を切り替えた際に列型が変わったら、演算子と値をデフォルトにリセット（date→eq, text→contains）
 - **受信時の UI 未対応オペレーターはドロップ**（`In`/`NotIn` など）
 - `restoreState` の sanitize で、列型と演算子の不整合・日付値フォーマット不正を検出して修復する
-- **表示フォーマット**: 日付列セルは `formatLocalDate(Date) → "YYYY-MM-DD"`（ローカル TZ）で統一。`cellToString()` が `extractTableData` / `appendIncrementalData` の両方で適用する。ロケール依存の `String(Date)` は使わない
-- **共通ヘルパー**: 条件のアクティブ判定は `isConditionActive(c)`、日付比較は `toDateEpochFromString` / `toLocalDateEpoch` / `formatLocalDate` に集約。重複ロジックを書かない
+- **表示フォーマット**: 日付列セルは `formatDateUTC(Date) → "YYYY-MM-DD"`（UTC）で統一。`cellToString()` が `extractTableData` / `appendIncrementalData` の両方で適用。ISO 文字列の場合は先頭 10 文字を抽出
+- **カレンダー UI**: `position: fixed` でカスタム DOM カレンダーポップアップを表示（PBI iframe 内で `<input type="date">` のネイティブピッカーが出ないため）。"today" ハイライトはローカル TZ、日付選択値は `YYYY-MM-DD` 文字列
+- **共通ヘルパー**: 条件のアクティブ判定は `isConditionActive(c)`、日付比較は `toDateEpochFromString` / `toDateEpoch` / `formatDateUTC` に集約。重複ロジックを書かない

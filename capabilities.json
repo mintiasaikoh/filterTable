@@ -54,10 +54,6 @@
                 "appliedLogic": {
                     "displayName": "適用済み論理演算子",
                     "type": { "text": true }
-                },
-                "selectionIdx": {
-                    "displayName": "選択行インデックス",
-                    "type": { "text": true }
                 }
             }
         }
