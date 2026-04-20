@@ -73,6 +73,9 @@ export class Visual implements IVisual {
     private dataLimitReached  = false; // 100MB メモリ制限到達フラグ
     private persistTimer: number | null = null;
     private scrollRaf:    number | null = null;
+    // 連続クリック時に applyJsonFilter 発行を間引くためのデバウンス状態
+    private emitTimer: number | null = null;
+    private pendingEmitMode: "search" | "selection" | null = null;
     private rootEl:       HTMLElement;
     private rowHeight     = ROW_H;
     private colWidths: Map<number, number> = new Map(); // 列インデックス → px幅
@@ -257,11 +260,11 @@ export class Visual implements IVisual {
             this.restoreState(dv);
         }
 
-        // 列構成が変わっていなければ常に jsonFilters から行選択を再構築。
+        // jsonFilters から行選択を毎回再構築。
         // 自己発火分は restoreFromJsonFilters 内の signature チェックで除外される。
-        if (!colsChanged) {
-            this.restoreFromJsonFilters(options.jsonFilters, dv);
-        }
+        // ページ遷移でビジュアルが再生成された初回ロード（colsChanged=true）でも、
+        // 外部スライサーが既にアクティブなら復元できるように無条件に呼ぶ。
+        this.restoreFromJsonFilters(options.jsonFilters, dv);
 
         // 範囲外インデックスを除去（行数が減った場合）
         const maxIdx = this.tableData.rows.length;
@@ -1100,9 +1103,27 @@ export class Visual implements IVisual {
             return;
         }
         this.hasAppliedFilter = true;
+        // SelectionManager（同一ページ）は即時。UX 上のクロスハイライトは待たせない
         this.selectionManager.select(ids);
 
-        // ページ間同期: 条件ベースなら AdvancedFilter、それ以外は BasicFilter
+        // applyJsonFilter（ページ間同期）は 150ms デバウンス。
+        // 大量行での連続クリック時に全列 × 全選択行の値集合構築を毎回実行するのは重いため、
+        // 最後のクリックから 150ms 静止した時点で 1 回だけ発行する。
+        // mode だけ記録し、srcIdx は fire 時に再計算（保留中に選択が変わった場合に備える）
+        this.pendingEmitMode = mode;
+        if (this.emitTimer !== null) clearTimeout(this.emitTimer);
+        this.emitTimer = window.setTimeout(() => this.flushJsonFilterEmit(), 150);
+    }
+
+    private flushJsonFilterEmit(): void {
+        this.emitTimer = null;
+        const mode = this.pendingEmitMode;
+        this.pendingEmitMode = null;
+        if (!mode) return;
+        const srcIdx = (mode === "search")
+            ? this.filteredOrigIdx.slice()
+            : Array.from(this.selectedOrigIdx);
+        if (srcIdx.length === 0) return;
         if (this.canUseAdvancedFilter()) {
             this.emitAdvancedFilterForSync();
         } else {
@@ -1320,6 +1341,9 @@ export class Visual implements IVisual {
     }
 
     private removeFilter(): void {
+        // 保留中の遅延発行を破棄（removeFilter 後に emit が走ると状態不整合になるため）
+        if (this.emitTimer !== null) { clearTimeout(this.emitTimer); this.emitTimer = null; }
+        this.pendingEmitMode = null;
         if (!this.hasAppliedFilter) return;
         this.selectionManager.clear();
         this.lastFilterJson = "";
