@@ -68,15 +68,32 @@ export function toDateEpochFromString(s: string): number {
 
 /**
  * 行の値 → UTC 0:00 epoch（時刻部分を切り捨て）。
- * PBI が Date オブジェクトではなく ISO 文字列で渡すケースにも対応。
+ * PBI が渡す可能性のある全形態に対応:
+ *   - Date オブジェクト
+ *   - ISO 先頭一致文字列 "YYYY-MM-DD..."
+ *   - 非 ISO 文字列（"2014/04/20" 等）→ Date コンストラクタにフォールバック
+ *   - 数値（epoch ms）
+ * いずれも UTC の年月日に揃えた epoch を返す。判定不能のみ NaN。
  */
 export function toDateEpoch(v: unknown): number {
+    if (v == null) return NaN;
     if (v instanceof Date) {
+        const t = v.getTime();
+        if (!Number.isFinite(t)) return NaN;
         return Date.UTC(v.getUTCFullYear(), v.getUTCMonth(), v.getUTCDate());
     }
     if (typeof v === "string") {
         const m = v.match(/^(\d{4})-(\d{2})-(\d{2})/);
         if (m) return Date.UTC(+m[1], +m[2] - 1, +m[3]);
+        // ISO 以外の文字列（ロケール表記など）は Date パーサに委ねる
+        const d = new Date(v);
+        const t = d.getTime();
+        if (Number.isFinite(t)) return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+        return NaN;
+    }
+    if (typeof v === "number" && Number.isFinite(v)) {
+        const d = new Date(v);
+        return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
     }
     return NaN;
 }

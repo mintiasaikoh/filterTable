@@ -347,14 +347,11 @@ export class Visual implements IVisual {
     private cellToString(v: PrimitiveValue, colType: ColumnType): string {
         if (v == null) return "";
         if (colType === "date") {
-            if (v instanceof Date) return formatDateUTC(v);
-            // PBI が ISO 文字列で渡すケース: "2014-01-01T15:00:00.000Z" → "2014-01-01"
-            if (typeof v === "string") {
-                const m = String(v).match(/^(\d{4})-(\d{2})-(\d{2})/);
-                if (m) return `${m[1]}-${m[2]}-${m[3]}`;
-                const d = new Date(v);
-                if (!isNaN(d.getTime())) return formatDateUTC(d);
-            }
+            // toDateEpoch と同じ解釈規則で "YYYY-MM-DD" に揃える。
+            // 表示と filter 比較を必ず同じ日付に寄せるため、分岐を増やさず
+            // epoch 経由で統一（Date / ISO / 非 ISO 文字列 / 数値 epoch ms すべて対応）。
+            const ep = toDateEpoch(v);
+            if (Number.isFinite(ep)) return formatDateUTC(new Date(ep));
         }
         return String(v);
     }
