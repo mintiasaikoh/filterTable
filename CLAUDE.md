@@ -54,7 +54,7 @@ Codex will review your output once you are done
 2. **raw 値（型付き）を渡す**: `tableData.rawRows[i][ci]` を使う。`String(v)` 化すると数値/日付列で型ミスマッチして他ビジュアルで何もヒットしない
 3. **incremental モードでは自前蓄積データを参照**: `lastDataView.table.rows` は最新チャンクのみ。`tableData.rawRows` から取得
 4. **数値列の自動集計（Sum）を対象に含める**: `isMeasure=true` だけで弾くと Sale Price 等の数値列が BasicFilter から抜け落ち、他ページで絞り込めない。`queryName` が `Sum(Table.Col)` 形式なら中身を剥がして target にする。**column 名は常に queryName の後半を使う**（displayName はユーザーリネームでズレる）
-5. **日時列は Date オブジェクト**: `normalizeValue()` で ISO 文字列化して比較・signature 生成。`String(date)` はロケール依存で受信エコーが一致せず無限ループになる。`BasicFilter` には raw Date を渡す（型は `string|number|boolean[]` にキャストが必要）
+5. **日付機能は本ビジュアルでは扱わない**: 日付フィルターは別ビジュアル `dateCalendar` に分離した。date 列がバインドされても本ビジュアルは **text 扱い（String 化して contains マッチ）** でフォールバックする
 
 ## RLS とセキュリティ
 
@@ -91,16 +91,14 @@ Codex will review your output once you are done
 ## データ保持構造
 
 ```typescript
-type ColumnType = "date" | "text";
 interface TableData {
     columns: string[];
     rows: string[][];              // 描画用（文字列化済み）
     rawRows: PrimitiveValue[][];   // BasicFilter 用（型保持）
-    types: ColumnType[];           // 列型: date/text。UI 分岐・演算子マップ用
 }
 ```
 
-`extractTableData` / `appendIncrementalData` の両方で `rawRows` / `types` も蓄積すること。`types` は `dv.table.columns[i].type?.dateTime` で判定。
+`extractTableData` / `appendIncrementalData` の両方で `rawRows` も蓄積すること。日付列は String 化して text 扱い（日付 UI は `dateCalendar` 側）。
 
 ## テーブル表示ルール
 
@@ -116,28 +114,10 @@ interface TableData {
 - 列セレクタで既に 2 条件ある他列は `disabled` option（ラベル末尾に "（上限）"）
 - `restoreState` で永続化された 3 条件以上は先頭 2 件に切り詰め
 
-## 日時列のカレンダーフィルター
+## 日付フィルターは別ビジュアル
 
-- `dv.table.columns[i].type?.dateTime === true` の列は `types[i] === "date"` として扱う
-- フィルター UI では値入力をカスタムカレンダーポップアップにし、演算子は `eq/neq/gte/lte/gt/lt`（「と同じ」「以外」「以降」「以前」「より後」「より前」）
-- **すべて UTC 基準**: PBI は日時値を UTC epoch の Date で渡す。`getUTCFullYear/Month/Date` で日付部分を取り出す。ローカル TZ（JST 等）の `getDate()` を使うと日付が 1 日ズレるため禁止
-- **日付単位で比較（時刻は無視）**: 行側は `Date.UTC(getUTCFullYear, getUTCMonth, getUTCDate)`、入力側は `Date.UTC(y, m-1, d)`。両者 UTC 0:00 に揃えて epoch 比較
-- **文字列値にも対応**: PBI が ISO 文字列（`"2014-01-01T15:00:00.000Z"`）で渡すケースがある。`toDateEpoch` / `cellToString` で先頭 10 文字を正規表現抽出して処理
-- **範囲指定**: 同一列に `gte YYYY-MM-DD` + `lte YYYY-MM-DD` の 2 条件で表現（1 列 2 条件制限の範囲内）
-- **AdvancedFilter は半開区間 `[start, next)` で発行する**（DateTime 列で時間成分のせいで境界漏れするのを回避）:
-  - `eq  YYYY-MM-DD` → `GreaterThanOrEqual YYYY-MM-DD AND LessThan YYYY-MM-(DD+1)` （列内 logical=And 強制）
-  - `neq YYYY-MM-DD` → `LessThan YYYY-MM-DD OR GreaterThanOrEqual YYYY-MM-(DD+1)` （列内 logical=Or 強制）
-  - `gte` / `lt` は単純マップ（`GreaterThanOrEqual` / `LessThan`）
-  - `gt  YYYY-MM-DD` → `GreaterThanOrEqual YYYY-MM-(DD+1)`
-  - `lte YYYY-MM-DD` → `LessThan YYYY-MM-(DD+1)`
-  - 同一列に 2 条件並ぶ場合（ユーザー指定範囲）は eq/neq を除外し範囲演算子のみ個別マップ（列内 2 条件制限の範囲で完結）
-  - 値は UTC midnight の `Date` オブジェクトで渡す。powerbi-models 型は `string|number|boolean` だが実行時 Date 受理（キャスト必要）
-  - 単純な `Is`/`IsNot` を使うと DateTime 列で時間込み完全一致を要求し 9 割外すため禁止
-  - エコー signature は emit / receive 両側で `${AdvancedFilterConditionOperators}:${YYYY-MM-DD}` 形式に揃える（半開区間展開後の実条件で signature を作る）
-- **エコー signature**: 値は `YYYY-MM-DD` 表記で統一（ISO 時刻込みは不安定）
-- **列型変更時のリセット**: 条件行で列を切り替えた際に列型が変わったら、演算子と値をデフォルトにリセット（date→eq, text→contains）
-- **受信時の UI 未対応オペレーターはドロップ**（`In`/`NotIn` など）
-- `restoreState` の sanitize で、列型と演算子の不整合・日付値フォーマット不正を検出して修復する
-- **表示フォーマット**: 日付列セルは `formatDateUTC(Date) → "YYYY-MM-DD"`（UTC）で統一。`cellToString()` が `extractTableData` / `appendIncrementalData` の両方で適用。ISO 文字列の場合は先頭 10 文字を抽出
-- **カレンダー UI**: `position: fixed` でカスタム DOM カレンダーポップアップを表示（PBI iframe 内で `<input type="date">` のネイティブピッカーが出ないため）。"today" ハイライトはローカル TZ、日付選択値は `YYYY-MM-DD` 文字列
-- **共通ヘルパー**: 条件のアクティブ判定は `isConditionActive(c)`、日付比較は `toDateEpochFromString` / `toDateEpoch` / `formatDateUTC` に集約。重複ロジックを書かない
+本ビジュアルは **text 系の contains / notContains 条件のみ**を扱う。日付範囲・単一日の絞り込みは別ビジュアル **`dateCalendar`** に分離した（`/Users/mymac/Developer/dateCalendar/`）。
+
+- date 列がバインドされても本ビジュアルはカレンダー UI を出さず、値を `String()` 化した上で text 扱いの contains マッチにフォールバックする
+- AdvancedFilter の半開区間 `[start, next)` 展開などの日付特有ロジックは本プロジェクトに残していない
+- 日付でクロスフィルターしたい場合は `dateCalendar` ビジュアルを同じページに配置し、同じデータモデル列にバインドする（AdvancedFilter 経由で他ビジュアルへ反映される）
