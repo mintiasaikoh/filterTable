@@ -4,8 +4,6 @@ import powerbi from "powerbi-visuals-api";
 import { FormattingSettingsService } from "powerbi-visuals-utils-formattingmodel";
 import {
     BasicFilter, IFilterColumnTarget, IBasicFilter,
-    AdvancedFilter, IAdvancedFilter, IAdvancedFilterCondition,
-    AdvancedFilterLogicalOperators, AdvancedFilterConditionOperators,
     FilterType,
 } from "powerbi-models";
 import "./../style/visual.less";
@@ -24,9 +22,8 @@ import DataViewTable               = powerbi.DataViewTable;
 
 import { VisualFormattingSettingsModel } from "./settings";
 import {
-    FilterOp, FilterCondition, PrimitiveValue, FilterValue, TableData,
-    normalizeValue,
-    isConditionActive, filterSignature, buildFilterTarget,
+    PrimitiveValue, FilterValue, TableData,
+    normalizeValue, filterSignature, buildFilterTarget,
 } from "./filterEngine";
 
 const ROW_H  = 24;   // px（tbody 行の高さ）
@@ -38,25 +35,22 @@ export class Visual implements IVisual {
     private formattingSettingsService: FormattingSettingsService;
 
     // ---- データ状態 ----
-    private conditions: FilterCondition[]        = [];
-    private logic: "AND" | "OR"                  = "AND";
+    private searchText: string                   = "";
+    private appliedSearchText: string            = "";
     private tableData: TableData                 = { columns: [], rows: [], rawRows: [] };
-    private appliedConditions: FilterCondition[] = [];
-    private appliedLogic: "AND" | "OR"           = "AND";
     private filteredRows: string[][]             = [];
     private filteredOrigIdx: number[]            = [];
     private selectedOrigIdx: Set<number>         = new Set();
-    private selectionIds: ISelectionId[]         = [];        // 行ごとの一意な SelectionId
+    private selectionIds: ISelectionId[]         = [];
     private selectionManager: ISelectionManager;
-    private lastDataView: DataView | null        = null;      // BasicFilter ターゲット生成用
-    private lastFilterJson = "";                              // 自己発火 BasicFilter/AdvancedFilter の検出用（エコー除外、プレフィックス付きシグネチャ）
-    private lastFilterMode: "ADV" | "BASIC" | null = null;    // 前回発火したフィルタ経路（遷移検知用）
-    private advFilterEmitted = false;                         // 中間チャンクで AdvancedFilter を発火済みか
-    private activeColTab  = -1;   // -1=全列表示, 0..n-1=指定列のみ表示
-    private prevColKey    = "";   // 列構成変化検知用（列名結合文字列）
+    private lastDataView: DataView | null        = null;
+    private lastFilterJson = ""; // BasicFilter 自己発火検出
+    private activeColTab  = -1;
+    private prevColKey    = "";
 
     // ---- DOM ----
     private filterPanel:  HTMLElement;
+    private searchInput:  HTMLInputElement;
     private colToggleBar: HTMLElement;
     private statusBar:    HTMLElement;
     private tableWrapper: HTMLElement;
@@ -68,20 +62,19 @@ export class Visual implements IVisual {
 
     // ---- 制御フラグ ----
     private hasInteracted     = false;
-    private hasAppliedFilter  = false; // selectionManager.clear() の無駄撃ちを防ぐ
-    private isLoadingMore     = false; // fetchMoreData 読み込み中フラグ
-    private dataLimitReached  = false; // 100MB メモリ制限到達フラグ
+    private hasAppliedFilter  = false;
+    private isLoadingMore     = false;
+    private dataLimitReached  = false;
     private persistTimer: number | null = null;
     private scrollRaf:    number | null = null;
-    // 連続クリック時に applyJsonFilter 発行を間引くためのデバウンス状態
     private emitTimer: number | null = null;
-    private pendingEmitMode: "search" | "selection" | null = null;
+    private searchDebounceTimer: number | null = null;
     private rootEl:       HTMLElement;
     private rowHeight     = ROW_H;
-    private colWidths: Map<number, number> = new Map(); // 列インデックス → px幅
-    private sortColIdx = -1;                           // ソート対象列（-1=なし）
-    private sortDir: "asc" | "desc" | null = null;     // ソート方向
-    private lastClickedRi = -1;                        // Shift+クリック用の起点行
+    private colWidths: Map<number, number> = new Map();
+    private sortColIdx = -1;
+    private sortDir: "asc" | "desc" | null = null;
+    private lastClickedRi = -1;
 
     constructor(options: VisualConstructorOptions) {
         this.host = options.host;
@@ -132,13 +125,12 @@ export class Visual implements IVisual {
     }
 
     // ==========================================================
-    // update — VisualUpdateType で分岐し、不要な再描画を抑制
+    // update
     // ==========================================================
     public update(options: VisualUpdateOptions): void {
         this.formattingSettings = this.formattingSettingsService
             .populateFormattingSettingsModel(VisualFormattingSettingsModel, options.dataViews?.[0]);
 
-        // リサイズのみの場合はスクロール再描画だけで済む（Data/Style が無ければ早期 return）
         const hasResize = !!(options.type & VisualUpdateType.Resize);
         const hasDataOrStyle = !!(options.type & (VisualUpdateType.Data | VisualUpdateType.Style));
         if (hasResize && !hasDataOrStyle) {
@@ -146,7 +138,6 @@ export class Visual implements IVisual {
             return;
         }
 
-        // Style のみ → 書式設定だけ反映して返る
         if (!(options.type & VisualUpdateType.Data)) {
             if (options.type & VisualUpdateType.Style) {
                 this.applyTableStyles();
@@ -159,7 +150,6 @@ export class Visual implements IVisual {
         const dv: DataView = options.dataViews?.[0];
         this.lastDataView = dv;
 
-        // --- fetchMoreData: incremental mode ---
         const isSegment = options.operationKind === VisualDataChangeOperationKind.Segment;
         const hasMoreSegments = !!(dv?.metadata?.segment);
 
@@ -178,30 +168,11 @@ export class Visual implements IVisual {
             this.dataLimitReached = false;
         }
 
-        // 読み込み中の中間チャンク
         if (isSegment && this.isLoadingMore) {
+            // 中間チャンクは runFilter だけ（DOM 再構築は抑制）
             this.runFilter();
-            const hasActiveSearch = this.appliedConditions.some(c => isConditionActive(c));
-            // AdvancedFilter 経路は全件条件評価なので、途中チャンクで即発火して他ページへ反映。
-            // selectedOrigIdx は触らない（中間の不完全な行集合でページ内 SelectionManager を
-            // 絞ると瞬間的な表示ブレが起きるため）。
-            if (hasActiveSearch && !this.advFilterEmitted && this.canUseAdvancedFilter()) {
-                this.emitAdvancedFilterForSync();
-                this.advFilterEmitted = true;
-            }
-            // 中間チャンクは描画を抑制（ステータスのみ更新）。最終チャンクで一括レンダリング。
             this.renderStatus();
             return;
-        }
-        // 最終チャンク完了後: 蓄積した検索ヒットをフィルターとして適用
-        if (isSegment && !this.isLoadingMore) {
-            this.runFilter();
-            const hasActiveSearch = this.appliedConditions.some(c => isConditionActive(c));
-            if (hasActiveSearch) {
-                // 最終チャンクで全件揃ったら検索ヒット集合で再発火（selectedOrigIdx は汚さない）
-                this.applyDatasetFilter("search");
-            }
-            this.advFilterEmitted = false; // 次の検索に備えてリセット
         }
 
         // --- 列変化検知 ---
@@ -214,34 +185,22 @@ export class Visual implements IVisual {
             this.sortColIdx = -1;
             this.sortDir = null;
             this.lastClickedRi = -1;
-            this.conditions = [];
-            this.appliedConditions = [];
-            // 列構成が変わったらフィルタ経路フラグをリセット。
-            // lastFilterJson が残っていると次回同一 signature の remove が「エコー扱い」で skip される
+            this.searchText = "";
+            this.appliedSearchText = "";
             this.lastFilterJson = "";
-            this.lastFilterMode = null;
-            this.advFilterEmitted = false;
-            // 既存フィルタを明示的に解除（次の emit が発火できるように）
             if (this.hasAppliedFilter) this.removeFilter();
             this.selectedOrigIdx.clear();
         }
 
-        // --- 状態復元（初回 or 列構成変化時のみ）---
-        // 行選択は永続化しないので restoreState は conditions のみ復元する。
-        // 真実源は options.jsonFilters に一本化されているので、restoreFromJsonFilters で
-        // 行選択（selectedOrigIdx）を毎回再構築する（ChicletSlicer パターン）。
         const isFirstLoad = !this.hasInteracted;
         if (isFirstLoad || colsChanged) {
             this.restoreState(dv);
         }
 
-        // jsonFilters から行選択を毎回再構築。
-        // 自己発火分は restoreFromJsonFilters 内の signature チェックで除外される。
-        // ページ遷移でビジュアルが再生成された初回ロード（colsChanged=true）でも、
-        // 外部スライサーが既にアクティブなら復元できるように無条件に呼ぶ。
+        // jsonFilters から行選択を毎回再構築
         this.restoreFromJsonFilters(options.jsonFilters, dv);
 
-        // 範囲外インデックスを除去（行数が減った場合）
+        // 範囲外インデックスを除去
         const maxIdx = this.tableData.rows.length;
         this.selectedOrigIdx.forEach(i => { if (i >= maxIdx) this.selectedOrigIdx.delete(i); });
         if (this.selectedOrigIdx.size === 0 && this.hasAppliedFilter) {
@@ -253,7 +212,7 @@ export class Visual implements IVisual {
         }
 
         // --- レンダリング ---
-        if (!this.filterPanel.querySelector(".value-input:focus")) {
+        if (!this.filterPanel.querySelector(".search-input:focus")) {
             this.renderFilterPanel();
         }
         this.renderColToggleBar();
@@ -265,39 +224,11 @@ export class Visual implements IVisual {
     }
 
     private restoreState(dv: DataView): void {
-        const m   = dv?.metadata?.objects?.["filterState"];
-        const len = this.tableData.columns.length;
-        const textOps = new Set<FilterOp>(["contains", "notContains"]);
-        // 範囲内チェック + 演算子の整合 + 列ごと 2 条件までで切り詰め
-        const sanitize = (arr: FilterCondition[]): FilterCondition[] => {
-            const filtered = arr.filter(c => c.columnIndex >= 0 && c.columnIndex < len);
-            const counts = new Map<number, number>();
-            const out: FilterCondition[] = [];
-            for (const c of filtered) {
-                const n = counts.get(c.columnIndex) ?? 0;
-                if (n >= 2) continue;
-                const repaired: FilterCondition = { ...c };
-                if (!textOps.has(repaired.operator)) {
-                    repaired.operator = "contains";
-                    repaired.value = "";
-                }
-                counts.set(c.columnIndex, n + 1);
-                out.push(repaired);
-            }
-            return out;
-        };
-        try   { this.conditions = sanitize(m?.["conditions"] ? JSON.parse(m["conditions"] as string) : []); }
-        catch { this.conditions = []; }
-        this.logic = (m?.["logic"] as string) === "OR" ? "OR" : "AND";
-        try   { this.appliedConditions = sanitize(m?.["applied"] ? JSON.parse(m["applied"] as string) : []); }
-        catch { this.appliedConditions = []; }
-        this.appliedLogic = (m?.["appliedLogic"] as string) === "OR" ? "OR" : "AND";
-
-        // 行選択 (selectedOrigIdx) はここで復元しない。
-        // 真実源は applyJsonFilter / options.jsonFilters 側に一本化しており、
-        // restoreFromJsonFilters() が外部受信経路で自然に再構築する（ChicletSlicer パターン）。
-        // 行 index を persistProperties({selector:null}) に保存するとレポート全体共有となり、
-        // RLS で可視行集合が異なるユーザー間で意味が壊れるため廃止した。
+        const m = dv?.metadata?.objects?.["filterState"];
+        this.searchText = String(m?.["searchText"] ?? "");
+        this.appliedSearchText = this.searchText;
+        // 行選択 (selectedOrigIdx) は永続化しない（RLS 原則）。
+        // 真実源は applyJsonFilter / options.jsonFilters。restoreFromJsonFilters で復元される。
     }
 
     private cellToString(v: PrimitiveValue): string {
@@ -334,131 +265,76 @@ export class Visual implements IVisual {
     }
 
     // ==========================================================
-    // フィルターパネル
+    // 検索パネル（単一の検索ボックス / 全列 substring マッチ）
     // ==========================================================
     private renderFilterPanel(): void {
-        // 再描画前にデバウンスタイマーをクリア
         if (this.persistTimer !== null) { clearTimeout(this.persistTimer); this.persistTimer = null; }
         this.clear(this.filterPanel);
 
         const hdr = this.el("div", "filter-header");
         const ttl = this.el("span", "filter-title");
-        ttl.textContent = "フィルター";
+        ttl.textContent = "検索";
         hdr.appendChild(ttl);
 
         const help = this.el("span", "filter-help") as HTMLSpanElement;
         help.textContent = "ⓘ";
-        help.title = "1 つの列につき最大 2 条件まで指定できます";
+        help.title = "全列対象の部分一致（ローカル絞り込み）。条件フィルターは filterCondition ビジュアルを利用してください。";
         hdr.appendChild(help);
 
-        const tog = this.el("div", "logic-toggle");
-        for (const v of ["AND", "OR"] as const) {
-            const b = this.el("button", "logic-btn" + (this.logic === v ? " active" : ""));
-            b.textContent = v;
-            b.onclick = () => { this.logic = v; this.debounceSave(); this.renderFilterPanel(); };
-            tog.appendChild(b);
-        }
-        hdr.appendChild(tog);
         this.filterPanel.appendChild(hdr);
 
-        const list = this.el("div", "condition-list");
-        this.conditions.forEach((c, i) => list.appendChild(this.makeConditionRow(c, i)));
-        this.filterPanel.appendChild(list);
-
-        const footer = this.el("div", "filter-footer");
-
-        // 列ごとの条件数カウント → 空きのある最初の列を次の追加先にする
-        const countByCol = new Map<number, number>();
-        this.conditions.forEach(c =>
-            countByCol.set(c.columnIndex, (countByCol.get(c.columnIndex) ?? 0) + 1));
-        const availableCol = this.tableData.columns.findIndex(
-            (_, i) => (countByCol.get(i) ?? 0) < 2);
-
-        const addBtn = this.el("button", "add-condition-btn") as HTMLButtonElement;
-        addBtn.textContent = "+ 条件を追加";
-        addBtn.disabled = availableCol < 0;
-        addBtn.title = addBtn.disabled
-            ? "すべての列が上限（2 条件）に達しました"
-            : "新しい条件行を追加";
-        addBtn.onclick = () => {
-            if (addBtn.disabled) return;
-            this.conditions.push({ columnIndex: availableCol, operator: "contains", value: "" });
-            this.debounceSave(); this.renderFilterPanel();
+        const row = this.el("div", "search-row");
+        this.searchInput = this.el("input", "search-input") as HTMLInputElement;
+        this.searchInput.type = "text";
+        this.searchInput.placeholder = "全列を部分一致検索";
+        this.searchInput.value = this.searchText;
+        this.searchInput.oninput = () => {
+            this.searchText = this.searchInput.value;
+            if (this.searchDebounceTimer !== null) clearTimeout(this.searchDebounceTimer);
+            this.searchDebounceTimer = window.setTimeout(() => {
+                this.searchDebounceTimer = null;
+                this.applySearchLocally();
+            }, 150);
         };
+        this.searchInput.onkeydown = (e: KeyboardEvent) => {
+            if (e.key === "Enter") {
+                if (this.searchDebounceTimer !== null) { clearTimeout(this.searchDebounceTimer); this.searchDebounceTimer = null; }
+                this.applySearchLocally();
+            }
+        };
+        row.appendChild(this.searchInput);
 
         const clearBtn = this.el("button", "clear-btn") as HTMLButtonElement;
-        clearBtn.textContent = "解除";
-        clearBtn.title = "フィルターを解除して全件表示";
-        clearBtn.disabled = this.appliedConditions.length === 0;
-        clearBtn.onclick = () => this.clearFilter();
+        clearBtn.textContent = "×";
+        clearBtn.title = "検索解除";
+        clearBtn.onclick = () => {
+            this.searchText = "";
+            this.searchInput.value = "";
+            this.applySearchLocally();
+        };
+        row.appendChild(clearBtn);
 
-        const runBtn = this.el("button", "run-btn");
-        runBtn.textContent = "実行";
-        runBtn.onclick = () => this.executeSearch();
+        this.filterPanel.appendChild(row);
 
-        footer.appendChild(addBtn); footer.appendChild(clearBtn); footer.appendChild(runBtn);
-        this.filterPanel.appendChild(footer);
-
-        if (availableCol < 0 && this.tableData.columns.length > 0) {
-            const note = this.el("div", "filter-note");
-            note.textContent = "列ごとの条件は最大 2 個までです";
-            this.filterPanel.appendChild(note);
-        }
+        const note = this.el("div", "filter-note");
+        note.textContent = "※ 検索はローカル絞り込みのみ。他ページへのクロスフィルターはチェックボックス選択で発火します。";
+        this.filterPanel.appendChild(note);
     }
 
-    private makeConditionRow(cond: FilterCondition, idx: number): HTMLElement {
-        const row = this.el("div", "condition-row");
-
-        const colSel = this.el("select", "col-select");
-        this.tableData.columns.forEach((col, i) => {
-            const o = this.el("option", "") as HTMLOptionElement;
-            o.value = String(i); o.textContent = col;
-            if (i === cond.columnIndex) o.selected = true;
-            const usedByOthers = this.conditions.filter((c, j) => j !== idx && c.columnIndex === i).length;
-            if (usedByOthers >= 2) {
-                o.disabled = true;
-                o.textContent = col + "（上限）";
-                o.title = "この列は既に 2 条件が設定されています";
-            }
-            colSel.appendChild(o);
-        });
-        colSel.onchange = () => {
-            this.conditions[idx].columnIndex = +colSel.value;
-            this.debounceSave(); this.renderFilterPanel();
-        };
-
-        const opSel = this.el("select", "op-select");
-        const opOptions: { v: FilterOp; l: string }[] = [
-            { v: "contains",    l: "を含む" },
-            { v: "notContains", l: "を含まない" },
-        ];
-        for (const { v, l } of opOptions) {
-            const o = this.el("option", "") as HTMLOptionElement;
-            o.value = v; o.textContent = l;
-            if (v === cond.operator) o.selected = true;
-            opSel.appendChild(o);
-        }
-        opSel.onchange = () => {
-            this.conditions[idx].operator = opSel.value as FilterOp;
-            this.debounceSave();
-        };
-
-        const inp = this.el("input", "value-input") as HTMLInputElement;
-        inp.type = "text";
-        inp.placeholder = "検索キーワード";
-        inp.value = cond.value;
-        inp.oninput   = () => { this.conditions[idx].value = inp.value; this.debounceSave(); };
-        inp.onkeydown = (e: KeyboardEvent) => { if (e.key === "Enter") this.executeSearch(); };
-
-        const del = this.el("button", "remove-btn"); del.textContent = "×";
-        del.onclick = () => { this.conditions.splice(idx, 1); this.debounceSave(); this.renderFilterPanel(); };
-
-        row.appendChild(colSel); row.appendChild(opSel); row.appendChild(inp); row.appendChild(del);
-        return row;
+    private applySearchLocally(): void {
+        this.hasInteracted = true;
+        this.appliedSearchText = this.searchText;
+        this.lastClickedRi = -1;
+        this.runFilter();
+        this.scrollEl.scrollTop = 0;
+        this.renderTableHeader();
+        this.renderVirtualRows();
+        this.renderStatus();
+        this.debounceSave();
     }
 
     // ==========================================================
-    // 列トグルバー（タブ動作：排他選択）
+    // 列トグルバー（タブ動作）
     // ==========================================================
     private renderColToggleBar(): void {
         this.clear(this.colToggleBar);
@@ -485,7 +361,6 @@ export class Visual implements IVisual {
         this.renderColToggleBar();
         this.renderTableHeader();
         this.renderVirtualRows();
-        // BasicFilter は全列で発火しているので列タブ切替時の再発火は不要
     }
 
     private isColVisible(i: number): boolean {
@@ -493,83 +368,24 @@ export class Visual implements IVisual {
     }
 
     // ==========================================================
-    // 検索
+    // ローカル絞り込み（全列 substring）
     // ==========================================================
-    private executeSearch(): void {
-        this.appliedConditions = this.conditions.map(c => ({ ...c }));
-        this.appliedLogic = this.logic;
-        this.advFilterEmitted = false; // 条件が変わったので中間チャンク発火フラグをリセット
-        this.commitFilter();
-    }
-
-    private clearFilter(): void {
-        this.appliedConditions = []; this.appliedLogic = "AND";
-        this.advFilterEmitted = false;
-        this.commitFilter();
-    }
-
-    private commitFilter(): void {
-        this.hasInteracted = true;
-        this.selectedOrigIdx.clear();
-        this.lastClickedRi = -1;
-
-        this.runFilter();
-
-        const hasActiveSearch = this.appliedConditions.some(c => isConditionActive(c));
-
-        // 検索は selectedOrigIdx を汚さない。条件ベース（AdvancedFilter）で他ページへ伝搬し、
-        // 該当行は検索結果から手動でチェックさせる（チェック ON 後は mode="selection" で BasicFilter 発火）。
-        if (hasActiveSearch && this.filteredRows.length > 0) {
-            this.applyDatasetFilter("search");
-        } else {
-            // 検索解除時はフィルターも解除
-            this.removeFilter();
-        }
-
-        this.renderTableHeader();
-        this.scrollEl.scrollTop = 0;
-        this.renderVirtualRows();
-        this.renderFilterPanel();
-        this.renderStatus();
-        requestAnimationFrame(() => this.persist());
-    }
-
     private runFilter(): void {
-        const active = this.appliedConditions.filter(c => isConditionActive(c));
         this.filteredRows = []; this.filteredOrigIdx = [];
+        const q = this.appliedSearchText.trim().toLowerCase();
 
-        if (active.length === 0) {
+        if (!q) {
             this.filteredRows    = this.tableData.rows.slice();
             this.filteredOrigIdx = this.tableData.rows.map((_, i) => i);
-            return;
+        } else {
+            this.tableData.rows.forEach((row, oi) => {
+                let hit = false;
+                for (let ci = 0; ci < row.length; ci++) {
+                    if ((row[ci] ?? "").toLowerCase().includes(q)) { hit = true; break; }
+                }
+                if (hit) { this.filteredRows.push(row); this.filteredOrigIdx.push(oi); }
+            });
         }
-
-        // 条件ごとに小文字化キーワードを事前計算
-        interface Prepared {
-            cond: FilterCondition;
-            keyword: string;
-        }
-        const prep: Prepared[] = active.map(c => ({
-            cond: c,
-            keyword: c.value.toLowerCase(),
-        }));
-
-        const isAnd = this.appliedLogic === "AND";
-
-        const evalOne = (p: Prepared, row: string[]): boolean => {
-            const hit = (row[p.cond.columnIndex] ?? "").toLowerCase().includes(p.keyword);
-            return hit === (p.cond.operator === "contains");
-        };
-
-        this.tableData.rows.forEach((row, oi) => {
-            let pass = isAnd;
-            for (let k = 0; k < prep.length; k++) {
-                const match = evalOne(prep[k], row);
-                if (match !== isAnd) { pass = match; break; }
-            }
-            if (pass) { this.filteredRows.push(row); this.filteredOrigIdx.push(oi); }
-        });
-
         this.applySort();
     }
 
@@ -578,7 +394,6 @@ export class Visual implements IVisual {
         const ci = this.sortColIdx;
         const dir = this.sortDir === "asc" ? 1 : -1;
 
-        // 比較キー生成: Date → getTime, 数値 → Number, それ以外 → 文字列
         const keyOf = (oi: number): number | string => {
             const raw = this.tableData.rawRows[oi]?.[ci];
             if (raw == null) return "";
@@ -640,14 +455,12 @@ export class Visual implements IVisual {
             label.textContent = col;
             th.appendChild(label);
 
-            // ソートインジケータ
             const arrow = this.el("span", "sort-indicator");
             if (this.sortColIdx === i && this.sortDir === "asc")  arrow.textContent = " ▲";
             else if (this.sortColIdx === i && this.sortDir === "desc") arrow.textContent = " ▼";
-            else arrow.textContent = " △"; // 未ソート
+            else arrow.textContent = " △";
             th.appendChild(arrow);
 
-            // ヘッダークリックでソート切替
             th.addEventListener("click", (e) => {
                 if ((e.target as HTMLElement).classList.contains("col-resize-handle")) return;
                 if (this.sortColIdx === i) {
@@ -657,13 +470,12 @@ export class Visual implements IVisual {
                     this.sortColIdx = i;
                     this.sortDir = "asc";
                 }
-                this.lastClickedRi = -1; // ソート変更で行順が変わるのでリセット
+                this.lastClickedRi = -1;
                 this.runFilter();
                 this.renderTableHeader();
                 this.renderVirtualRows();
             });
 
-            // リサイズハンドル
             const handle = this.el("div", "col-resize-handle");
             handle.addEventListener("mousedown", (e) => this.onColResizeStart(e, i));
             th.appendChild(handle);
@@ -672,9 +484,8 @@ export class Visual implements IVisual {
         });
         this.thead.appendChild(tr);
 
-        // 列幅が指定されている場合、テーブル幅を合計に設定して横スクロールを有効化
         if (this.colWidths.size > 0) {
-            let total = 32; // cb col
+            let total = 32;
             this.tableData.columns.forEach((_, i) => {
                 if (!this.isColVisible(i)) return;
                 total += this.colWidths.get(i) || 120;
@@ -703,7 +514,6 @@ export class Visual implements IVisual {
         }
 
         const rh = this.rowHeight;
-        // wordWrap ON の場合、行の実高さが可変になるためバッファを大幅に拡大
         const isWordWrap = this.formattingSettings?.valuesCard?.wordWrap?.value ?? false;
         const buf = isWordWrap ? BUFFER * 4 : BUFFER;
         const startRow = Math.max(0, Math.floor(scrollTop / rh) - buf);
@@ -741,11 +551,9 @@ export class Visual implements IVisual {
         const cbTd = this.el("td", "cb-col") as HTMLTableCellElement;
         const cb   = this.el("input", "") as HTMLInputElement;
         cb.type = "checkbox"; cb.checked = sel;
-        // checkbox のネイティブ toggle を無効化（tr click ハンドラに任せる）
         cb.addEventListener("click", (ev) => { ev.preventDefault(); });
         cbTd.appendChild(cb); tr.appendChild(cbTd);
 
-        // 行全体のクリックで選択（Ctrl/Shift 対応）
         tr.addEventListener("click", (e) => {
             this.handleRowClick(ri, e);
         });
@@ -769,7 +577,6 @@ export class Visual implements IVisual {
         const ctrlOrMeta = e.ctrlKey || e.metaKey;
 
         if (e.shiftKey && this.lastClickedRi >= 0) {
-            // Shift+クリック: 範囲選択
             const from = Math.min(this.lastClickedRi, ri);
             const to   = Math.max(this.lastClickedRi, ri);
             if (!ctrlOrMeta) this.selectedOrigIdx.clear();
@@ -777,10 +584,9 @@ export class Visual implements IVisual {
                 this.selectedOrigIdx.add(this.filteredOrigIdx[r]);
             }
         } else if (ctrlOrMeta) {
-            // Ctrl/Cmd+クリック: トグル追加/解除
-            this.selectedOrigIdx.has(oi) ? this.selectedOrigIdx.delete(oi) : this.selectedOrigIdx.add(oi);
+            if (this.selectedOrigIdx.has(oi)) this.selectedOrigIdx.delete(oi);
+            else this.selectedOrigIdx.add(oi);
         } else {
-            // 通常クリック: 1件だけ選択中で同じ行なら解除、それ以外は単一選択
             const onlyThis = this.selectedOrigIdx.size === 1 && this.selectedOrigIdx.has(oi);
             this.selectedOrigIdx.clear();
             if (!onlyThis) this.selectedOrigIdx.add(oi);
@@ -806,29 +612,21 @@ export class Visual implements IVisual {
 
     private commitSelection(): void {
         this.hasInteracted = true;
-        this.applyDatasetFilter("selection");
+        this.applyDatasetFilter();
         this.updateSelectionUI();
         this.renderStatus();
-        // 行選択は persistProperties には保存しない（真実源は applyJsonFilter / jsonFilters）。
-        // ここで persist() は呼ばない。条件変更は commitSelection を経由しない別経路で persist される。
     }
 
     /**
-     * クロスフィルターのソースを mode で切替:
-     * - "search":    検索ヒット行 (filteredOrigIdx) を使用。selectedOrigIdx は触らない
-     * - "selection": 明示的に選んだ行 (selectedOrigIdx) を使用
-     * 両経路とも SelectionManager（同一ページ）と applyJsonFilter（ページ間）を発火する。
+     * 選択行の値で BasicFilter を発火（全列）+ SelectionManager（同ページ）
+     * 連続クリックに備えて applyJsonFilter は 150ms デバウンス。
      */
-    private applyDatasetFilter(mode: "search" | "selection"): void {
-        const srcIdx = (mode === "search")
-            ? this.filteredOrigIdx.slice()
-            : Array.from(this.selectedOrigIdx);
-
+    private applyDatasetFilter(): void {
+        const srcIdx = Array.from(this.selectedOrigIdx);
         if (srcIdx.length === 0) {
             this.removeFilter();
             return;
         }
-        // SelectionId ベースで正確な行をクロスフィルター（同一ページ内）
         const ids = srcIdx
             .filter(i => i < this.selectionIds.length)
             .map(i => this.selectionIds[i]);
@@ -837,115 +635,17 @@ export class Visual implements IVisual {
             return;
         }
         this.hasAppliedFilter = true;
-        // SelectionManager（同一ページ）は即時。UX 上のクロスハイライトは待たせない
         this.selectionManager.select(ids);
 
-        // applyJsonFilter（ページ間同期）は 150ms デバウンス。
-        // 大量行での連続クリック時に全列 × 全選択行の値集合構築を毎回実行するのは重いため、
-        // 最後のクリックから 150ms 静止した時点で 1 回だけ発行する。
-        // mode だけ記録し、srcIdx は fire 時に再計算（保留中に選択が変わった場合に備える）
-        this.pendingEmitMode = mode;
         if (this.emitTimer !== null) clearTimeout(this.emitTimer);
-        this.emitTimer = window.setTimeout(() => this.flushJsonFilterEmit(), 150);
+        this.emitTimer = window.setTimeout(() => this.flushJsonFilterEmit(srcIdx), 150);
     }
 
-    private flushJsonFilterEmit(): void {
+    private flushJsonFilterEmit(_snapshotSrc: number[]): void {
         this.emitTimer = null;
-        const mode = this.pendingEmitMode;
-        this.pendingEmitMode = null;
-        if (!mode) return;
-        const srcIdx = (mode === "search")
-            ? this.filteredOrigIdx.slice()
-            : Array.from(this.selectedOrigIdx);
+        const srcIdx = Array.from(this.selectedOrigIdx);
         if (srcIdx.length === 0) return;
-        if (this.canUseAdvancedFilter()) {
-            this.emitAdvancedFilterForSync();
-        } else {
-            this.emitBasicFilterForSync(srcIdx);
-        }
-    }
-
-    /**
-     * AdvancedFilter で条件を表現可能か判定。
-     * - 条件 0 件: false（条件フィルタでない → BasicFilter で行値同期）
-     * - 列横断 OR: false（Power BI AdvancedFilter は列間を暗黙 AND で結合するため表現不能）
-     * - 同一列 3 条件以上: false（API 仕様で 1 列 2 条件まで。UI 側で制限しているが永続化復元の保険）
-     */
-    private canUseAdvancedFilter(): boolean {
-        const active = this.appliedConditions.filter(c => isConditionActive(c));
-        if (active.length === 0) return false;
-
-        const byCol = new Map<number, number>();
-        for (const c of active) byCol.set(c.columnIndex, (byCol.get(c.columnIndex) ?? 0) + 1);
-
-        for (const count of byCol.values()) {
-            if (count > 2) return false;
-        }
-        if (byCol.size >= 2 && this.appliedLogic === "OR") return false;
-        return true;
-    }
-
-    private emitAdvancedFilterForSync(): void {
-        const dv = this.lastDataView;
-        if (!dv?.table?.columns?.length) return;
-
-        const active = this.appliedConditions.filter(c => isConditionActive(c));
-        if (active.length === 0) return;
-
-        // 列ごとにグループ化
-        const byCol = new Map<number, FilterCondition[]>();
-        for (const c of active) {
-            if (!byCol.has(c.columnIndex)) byCol.set(c.columnIndex, []);
-            byCol.get(c.columnIndex).push(c);
-        }
-
-        const cols = dv.table.columns;
-        const filters: AdvancedFilter[] = [];
-        const sigParts: string[] = [];
-        // 列間は Power BI が暗黙 AND で結合。列内の logicalOperator は appliedLogic。
-        const globalLogical: AdvancedFilterLogicalOperators =
-            this.appliedLogic === "OR" ? "Or" : "And";
-
-        const opMapText = (op: FilterOp): AdvancedFilterConditionOperators | null => {
-            if (op === "contains")    return "Contains";
-            if (op === "notContains") return "DoesNotContain";
-            return null;
-        };
-
-        for (const [ci, conds] of byCol) {
-            const col = cols[ci];
-            if (!col) continue;
-            const target = buildFilterTarget(col);
-            if (!target) continue;
-
-            const advConds: IAdvancedFilterCondition[] = [];
-            const sigItems: string[] = [];
-
-            for (const c of conds) {
-                const op = opMapText(c.operator);
-                if (!op) continue;
-                advConds.push({ operator: op, value: c.value } as unknown as IAdvancedFilterCondition);
-                sigItems.push(`${op}:${c.value}`);
-            }
-            if (advConds.length === 0) continue;
-
-            filters.push(new AdvancedFilter(target, globalLogical, ...advConds));
-            const condSig = sigItems.slice().sort().join(",");
-            sigParts.push(`${target.table}\0${target.column}\0${globalLogical}\0${condSig}`);
-        }
-
-        if (filters.length === 0) return;
-
-        const key = "ADV|" + sigParts.slice().sort().join("|");
-        if (key === this.lastFilterJson && this.lastFilterMode === "ADV") return;
-
-        // 経路遷移時は前のフィルタを確実に除去してから新経路で merge
-        if (this.lastFilterMode === "BASIC") {
-            this.host.applyJsonFilter(null, "general", "filter", FilterAction.remove);
-        }
-        this.lastFilterJson = key;
-        this.lastFilterMode = "ADV";
-        this.host.applyJsonFilter(filters, "general", "filter", FilterAction.merge);
+        this.emitBasicFilterForSync(srcIdx);
     }
 
     private emitBasicFilterForSync(srcIdx: number[]): void {
@@ -953,10 +653,6 @@ export class Visual implements IVisual {
         if (!dv?.table?.columns?.length) return;
 
         const cols = dv.table.columns;
-        const selArr = srcIdx;
-        if (selArr.length === 0) return;
-
-        // 全列に対して BasicFilter を生成（他ページのスライサー/テーブルの絞り込み精度を最大化）
         const filters: BasicFilter[] = [];
         const sigParts: string[] = [];
 
@@ -964,9 +660,8 @@ export class Visual implements IVisual {
             const target = buildFilterTarget(cols[ci]);
             if (!target) continue;
 
-            // 正規化キーで重複排除しつつ、BasicFilter には raw（Date 含む）を渡す
             const valueMap = new Map<string, FilterValue>();
-            for (const i of selArr) {
+            for (const i of srcIdx) {
                 const raw = this.tableData.rawRows[i]?.[ci];
                 if (raw == null || raw === "") continue;
                 const key = normalizeValue(raw);
@@ -974,7 +669,6 @@ export class Visual implements IVisual {
             }
             if (valueMap.size === 0) continue;
 
-            // powerbi-models の型は Date を受け付けないが、実行時は受理される
             const rawValues = Array.from(valueMap.values()) as (string | number | boolean)[];
             filters.push(new BasicFilter(target, "In", ...rawValues));
             sigParts.push(filterSignature(target, Array.from(valueMap.keys())));
@@ -982,53 +676,33 @@ export class Visual implements IVisual {
 
         if (filters.length === 0) return;
 
-        // エコー比較のため常にソート済み＋プレフィックスで保存
         const key = "BASIC|" + sigParts.slice().sort().join("|");
-        if (key === this.lastFilterJson && this.lastFilterMode === "BASIC") return;
+        if (key === this.lastFilterJson) return;
 
-        // 経路遷移時は前のフィルタを確実に除去してから新経路で merge
-        if (this.lastFilterMode === "ADV") {
-            this.host.applyJsonFilter(null, "general", "filter", FilterAction.remove);
-        }
         this.lastFilterJson = key;
-        this.lastFilterMode = "BASIC";
         this.host.applyJsonFilter(filters, "general", "filter", FilterAction.merge);
     }
 
     private removeFilter(): void {
-        // 保留中の遅延発行を破棄（removeFilter 後に emit が走ると状態不整合になるため）
         if (this.emitTimer !== null) { clearTimeout(this.emitTimer); this.emitTimer = null; }
-        this.pendingEmitMode = null;
         if (!this.hasAppliedFilter) return;
         this.selectionManager.clear();
         this.lastFilterJson = "";
-        this.lastFilterMode = null;
-        this.advFilterEmitted = false;
         this.host.applyJsonFilter(null, "general", "filter", FilterAction.remove);
         this.hasAppliedFilter = false;
     }
 
-    /** 外部からの BasicFilter / AdvancedFilter を受信した場合に選択・条件を復元 */
+    /** 外部 BasicFilter を受信して行選択を復元（AdvancedFilter は filterCondition 側の責務なので無視） */
     private restoreFromJsonFilters(jsonFilters: powerbi.IFilter[] | undefined, dv: DataView): boolean {
         if (!jsonFilters || jsonFilters.length === 0) return false;
 
-        // FilterType で分類（powerbi.IFilter は filterType を持たないので powerbi-models の IFilter に経由）
-        const advanced: IAdvancedFilter[] = [];
         const basic: IBasicFilter[] = [];
         for (const f of jsonFilters) {
             const ft = (f as unknown as { filterType?: FilterType })?.filterType;
-            if (ft === FilterType.Advanced) advanced.push(f as unknown as IAdvancedFilter);
-            else if (ft === FilterType.Basic) basic.push(f as unknown as IBasicFilter);
+            if (ft === FilterType.Basic) basic.push(f as unknown as IBasicFilter);
         }
-
-        // AdvancedFilter が含まれる場合はそちらを優先して復元
-        if (advanced.length > 0) {
-            return this.restoreFromAdvancedFilters(advanced, dv);
-        }
-        if (basic.length > 0) {
-            return this.restoreFromBasicFilters(basic, dv);
-        }
-        return false;
+        if (basic.length === 0) return false;
+        return this.restoreFromBasicFilters(basic, dv);
     }
 
     private restoreFromBasicFilters(basicFilters: IBasicFilter[], dv: DataView): boolean {
@@ -1060,7 +734,6 @@ export class Visual implements IVisual {
         const incomingKey = "BASIC|" + parsed.map(p => p.sig).sort().join("|");
         if (incomingKey === this.lastFilterJson) return false;
 
-        // 全ての filter に一致する行を集計（AND）- rawRows + normalizeValue で型差異を吸収
         const matched = new Set<number>();
         this.tableData.rawRows.forEach((row, i) => {
             for (const p of parsed) {
@@ -1071,16 +744,11 @@ export class Visual implements IVisual {
             matched.add(i);
         });
 
-        // 一致ゼロ = 現在のウィンドウに該当行が無いだけの可能性が高い。
-        // 現セッションの行選択 (selectedOrigIdx) を破壊しないよう early return
-        // （lastFilterJson も更新しない）。
         if (matched.size === 0) return false;
 
         this.selectedOrigIdx = matched;
         this.lastFilterJson = incomingKey;
-        this.lastFilterMode = "BASIC";
 
-        // SelectionManager 側も同期（他ビジュアルへのクロスフィルター）
         const ids = Array.from(this.selectedOrigIdx)
             .filter(i => i < this.selectionIds.length)
             .map(i => this.selectionIds[i]);
@@ -1090,111 +758,6 @@ export class Visual implements IVisual {
         }
         return true;
     }
-
-    /** AdvancedFilter 受信 → 条件 UI を復元し、ローカル行にもフィルタを適用 */
-    private restoreFromAdvancedFilters(advFilters: IAdvancedFilter[], dv: DataView): boolean {
-        const cols = dv?.table?.columns || [];
-
-        const opMapIn = (op: string): FilterOp | null => {
-            if (op === "Contains")       return "contains";
-            if (op === "DoesNotContain") return "notContains";
-            return null;
-        };
-
-        interface RestoredCond { op: FilterOp; value: string; sigItem: string; }
-        interface Restored { colIdx: number; logic: AdvancedFilterLogicalOperators; conds: RestoredCond[]; sig: string; }
-        const restored: Restored[] = [];
-        let globalLogic: "AND" | "OR" = "AND";
-
-        for (const af of advFilters) {
-            const tgt = af.target as IFilterColumnTarget;
-            if (!tgt || !af.conditions || af.conditions.length === 0) continue;
-
-            let colIdx = -1;
-            for (let i = 0; i < cols.length; i++) {
-                const t = buildFilterTarget(cols[i]);
-                if (t && t.table === tgt.table && t.column === tgt.column) { colIdx = i; break; }
-            }
-            if (colIdx < 0) continue;
-
-            const condsRaw: RestoredCond[] = [];
-            for (const c of af.conditions) {
-                const mapped = opMapIn(String(c.operator));
-                if (!mapped) continue; // UI 未対応のオペレーターはドロップ
-                const valStr = String(c.value ?? "");
-                if (valStr === "") continue;
-                condsRaw.push({
-                    op: mapped,
-                    value: valStr,
-                    sigItem: `${c.operator}:${valStr}`,
-                });
-            }
-            if (condsRaw.length === 0) continue;
-
-            // 1 列 2 条件まで（UI / API 制約）
-            const kept = condsRaw.slice(0, 2);
-            const logic = (af.logicalOperator || "And") as AdvancedFilterLogicalOperators;
-            if (kept.length >= 2) globalLogic = logic === "Or" ? "OR" : "AND";
-
-            const condSig = kept.map(k => k.sigItem).sort().join(",");
-            restored.push({
-                colIdx, logic, conds: kept,
-                sig: `${tgt.table}\0${tgt.column}\0${logic}\0${condSig}`,
-            });
-        }
-        if (restored.length === 0) return false;
-
-        const incomingKey = "ADV|" + restored.map(r => r.sig).sort().join("|");
-        if (incomingKey === this.lastFilterJson) return false;
-
-        // FilterCondition 配列を再構築
-        const newConds: FilterCondition[] = [];
-        for (const r of restored) {
-            for (const c of r.conds) {
-                newConds.push({
-                    columnIndex: r.colIdx,
-                    operator: c.op,
-                    value: c.value,
-                });
-            }
-        }
-
-        // 編集中の UI 状態（this.conditions / this.logic）は上書きしない。
-        // ユーザーが条件入力中に他ビジュアルからの同期が飛んできても入力が消えないように、
-        // 「適用済み」側 (appliedConditions / appliedLogic) のみ同期する。
-        // ただし UI が空（未タッチ）の場合は UI にも同期してユーザーに見せる。
-        const uiIsEmpty = this.conditions.length === 0
-            || this.conditions.every(c => !isConditionActive(c));
-        if (uiIsEmpty) {
-            this.conditions = newConds.map(c => ({ ...c }));
-            this.logic      = globalLogic;
-        }
-        this.appliedConditions = newConds;
-        this.appliedLogic      = globalLogic;
-
-        // ローカル表示用にもフィルタを適用し、一致行を selection に反映
-        this.runFilter();
-        const matched = new Set<number>(this.filteredOrigIdx);
-
-        // 一致 0 件は未ロード等の可能性があるので selection は破壊せず、
-        // lastFilterJson も更新しない（次回データが揃った時の再マッチを許す）。
-        if (matched.size === 0) return true;
-
-        this.lastFilterJson = incomingKey;
-        this.lastFilterMode = "ADV";
-
-        this.selectedOrigIdx = matched;
-        const ids = Array.from(this.selectedOrigIdx)
-            .filter(i => i < this.selectionIds.length)
-            .map(i => this.selectionIds[i]);
-        if (ids.length > 0) {
-            this.hasAppliedFilter = true;
-            this.selectionManager.select(ids);
-        }
-        return true;
-    }
-
-
 
     private updateSelectionUI(): void {
         this.tbody.querySelectorAll("tr[data-ri]").forEach((el: Element) => {
@@ -1230,15 +793,10 @@ export class Visual implements IVisual {
             this.statusBar.appendChild(document.createTextNode(countText));
         }
 
-        const searchActive = this.appliedConditions.some(c => isConditionActive(c));
         const selSize = this.selectedOrigIdx.size;
-        if (searchActive && selSize === 0) {
-            // 検索中で未選択: 一致件数は countText で既に表示済み。追加表示なし。
-        } else if (selSize > 0) {
+        if (selSize > 0) {
             const info = this.el("span", "sel-info");
-            info.textContent = searchActive
-                ? `　${selSize} 件選択`
-                : `　${selSize} 件選択中`;
+            info.textContent = `　${selSize} 件選択中`;
             this.statusBar.appendChild(info);
             const clr = this.el("button", "clear-sel-btn");
             clr.textContent = "選択解除";
@@ -1246,7 +804,6 @@ export class Visual implements IVisual {
             this.statusBar.appendChild(clr);
         }
     }
-
 
     // ==========================================================
     // 列幅リサイズ
@@ -1256,7 +813,6 @@ export class Visual implements IVisual {
         e.stopPropagation();
         const startX = e.clientX;
 
-        // th 要素から実際の描画幅を取得（<col> は offsetWidth が常に 0）
         const ths = this.thead.querySelectorAll("th");
         let visIdx = 0;
         for (let i = 0; i < this.tableData.columns.length; i++) {
@@ -1264,10 +820,9 @@ export class Visual implements IVisual {
             if (i === colIdx) break;
             visIdx++;
         }
-        const thEl = ths[visIdx + 1] as HTMLElement; // +1 for cb col
+        const thEl = ths[visIdx + 1] as HTMLElement;
         const startW = thEl ? thEl.getBoundingClientRect().width : 80;
 
-        // 対応する col 要素も同時に更新
         const colEls = this.colGroup.querySelectorAll("col");
         const colEl = colEls[visIdx + 1] as HTMLElement;
 
@@ -1297,7 +852,6 @@ export class Visual implements IVisual {
         const h = this.formattingSettings.columnHeaderCard;
         const s = this.rootEl.style;
 
-        // 値（セル）のスタイル
         const vSize = v.font.fontSize.value;
         s.setProperty("--val-font-family", v.font.fontFamily.value);
         s.setProperty("--val-font-size", vSize + "pt");
@@ -1310,11 +864,9 @@ export class Visual implements IVisual {
         s.setProperty("--val-alt-bg", v.altBackgroundColor.value.value);
         s.setProperty("--val-white-space", v.wordWrap.value ? "pre-line" : "nowrap");
 
-        // 行高さをフォントサイズに連動（pt→px換算 * 1.6 + padding）
         this.rowHeight = Math.max(ROW_H, Math.round(vSize * 1.333 * 1.6 + 4));
         s.setProperty("--val-row-height", this.rowHeight + "px");
 
-        // 列見出しのスタイル
         s.setProperty("--hdr-font-family", h.font.fontFamily.value);
         s.setProperty("--hdr-font-size", h.font.fontSize.value + "pt");
         s.setProperty("--hdr-font-weight", h.font.bold.value ? "bold" : "normal");
@@ -1334,11 +886,9 @@ export class Visual implements IVisual {
 
     private persist(): void {
         this.hasInteracted = true;
-        // selectionIdx はレポート全体共有で RLS で壊れるため保存しない。
-        // 行選択は applyJsonFilter / options.jsonFilters 経由で自然に復元される（真実源一本化）。
+        // 検索語のみ永続化（行選択は真実源 = jsonFilters で復元）
         this.host.persistProperties({ merge: [{ objectName: "filterState", selector: null, properties: {
-            conditions: JSON.stringify(this.conditions), logic: this.logic,
-            applied: JSON.stringify(this.appliedConditions), appliedLogic: this.appliedLogic,
+            searchText: this.searchText,
         }}]});
     }
 
@@ -1352,5 +902,6 @@ export class Visual implements IVisual {
     public destroy(): void {
         if (this.persistTimer !== null) { clearTimeout(this.persistTimer); this.persistTimer = null; }
         if (this.scrollRaf !== null) { cancelAnimationFrame(this.scrollRaf); this.scrollRaf = null; }
+        if (this.searchDebounceTimer !== null) { clearTimeout(this.searchDebounceTimer); this.searchDebounceTimer = null; }
     }
 }

@@ -7,14 +7,6 @@ import { IFilterColumnTarget } from "powerbi-models";
 // 共有型
 // ==========================================================
 
-export type FilterOp = "contains" | "notContains";
-
-export interface FilterCondition {
-    columnIndex: number;
-    operator: FilterOp;
-    value: string;
-}
-
 export type PrimitiveValue = string | number | boolean | Date | null;
 export type FilterValue = string | number | boolean | Date;
 
@@ -37,11 +29,6 @@ export function normalizeValue(v: unknown): string {
     return String(v);
 }
 
-/** 条件が「検索に寄与するアクティブな条件」か */
-export function isConditionActive(c: FilterCondition): boolean {
-    return c.value.trim() !== "";
-}
-
 /** target + 正規化済みキー配列の比較キー */
 export function filterSignature(target: IFilterColumnTarget, normalizedKeys: string[]): string {
     const sorted = normalizedKeys.slice().sort();
@@ -49,7 +36,7 @@ export function filterSignature(target: IFilterColumnTarget, normalizedKeys: str
 }
 
 /**
- * DataViewMetadataColumn から BasicFilter / AdvancedFilter の target を生成。
+ * DataViewMetadataColumn から BasicFilter の target を生成。
  * 集計ラッパー "Sum(Table.Column)" 等は中身を剥がす。DAX メジャーは対象外。
  */
 export function buildFilterTarget(col: powerbi.DataViewMetadataColumn): IFilterColumnTarget | null {
