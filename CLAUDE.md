@@ -12,7 +12,18 @@ Codex will review your output once you are done
 | `applyJsonFilter(BasicFilter[])` | ページ間・スライサー | 値ベース同期（手動行選択・外部スライサー由来） |
 | `applyJsonFilter(AdvancedFilter[])` | ページ間・スライサー | 条件ベース同期（Contains/DoesNotContain + AND/OR） |
 
-`applyDatasetFilter()` で SelectionManager と applyJsonFilter を同時に発火している。詳細は `~/.claude/skills/powerbi-custom-visuals/SKILL.md`。
+`applyDatasetFilter(mode)` で SelectionManager と applyJsonFilter を同時に発火している。詳細は `~/.claude/skills/powerbi-custom-visuals/SKILL.md`。
+
+### mode="search" / "selection" の責務分離
+
+`applyDatasetFilter(mode)` はクロスフィルターのソースを切り替える:
+
+| mode | ソース | 呼び出し元 |
+|---|---|---|
+| `"search"` | `filteredOrigIdx`（検索ヒット行） | `commitFilter()` / `update()` 最終チャンク |
+| `"selection"` | `selectedOrigIdx`（チェックされた行） | `commitSelection()` / `toggleSelectAll()` / `clearSelection()` |
+
+**検索ヒットは `selectedOrigIdx` を汚さない**。検索は「ローカル絞り込み + 条件ベース AdvancedFilter」だけに留め、該当行は検索結果から手でチェックしてもらう。チェックされた行のみが BasicFilter として他ページに送られる（mode="selection" 経路）。`emitBasicFilterForSync(srcIdx)` は引数のインデックス配列から値集合を生成する（`selectedOrigIdx` を直接参照しない）。
 
 ## BasicFilter vs AdvancedFilter の使い分け
 

@@ -220,9 +220,8 @@ export class Visual implements IVisual {
             this.runFilter();
             const hasActiveSearch = this.appliedConditions.some(c => isConditionActive(c, this.tableData.types));
             if (hasActiveSearch) {
-                // 最終チャンクで全件揃ったので selectedOrigIdx を確定させる
-                this.filteredOrigIdx.forEach(i => this.selectedOrigIdx.add(i));
-                this.applyDatasetFilter();
+                // 最終チャンクで全件揃ったら検索ヒット集合で再発火（selectedOrigIdx は汚さない）
+                this.applyDatasetFilter("search");
             }
             this.advFilterEmitted = false; // 次の検索に備えてリセット
         }
@@ -754,10 +753,10 @@ export class Visual implements IVisual {
 
         const hasActiveSearch = this.appliedConditions.some(c => isConditionActive(c, this.tableData.types));
 
-        // 検索結果がある場合、全結果行を自動選択してクロスフィルター適用
+        // 検索は selectedOrigIdx を汚さない。条件ベース（AdvancedFilter）で他ページへ伝搬し、
+        // 該当行は検索結果から手動でチェックさせる（チェック ON 後は mode="selection" で BasicFilter 発火）。
         if (hasActiveSearch && this.filteredRows.length > 0) {
-            this.filteredOrigIdx.forEach(i => this.selectedOrigIdx.add(i));
-            this.applyDatasetFilter();
+            this.applyDatasetFilter("search");
         } else {
             // 検索解除時はフィルターも解除
             this.removeFilter();
@@ -1070,20 +1069,30 @@ export class Visual implements IVisual {
 
     private commitSelection(): void {
         this.hasInteracted = true;
-        this.applyDatasetFilter();
+        this.applyDatasetFilter("selection");
         this.updateSelectionUI();
         this.renderStatus();
         // 行選択は persistProperties には保存しない（真実源は applyJsonFilter / jsonFilters）。
         // ここで persist() は呼ばない。条件変更は commitSelection を経由しない別経路で persist される。
     }
 
-    private applyDatasetFilter(): void {
-        if (this.selectedOrigIdx.size === 0) {
+    /**
+     * クロスフィルターのソースを mode で切替:
+     * - "search":    検索ヒット行 (filteredOrigIdx) を使用。selectedOrigIdx は触らない
+     * - "selection": 明示的に選んだ行 (selectedOrigIdx) を使用
+     * 両経路とも SelectionManager（同一ページ）と applyJsonFilter（ページ間）を発火する。
+     */
+    private applyDatasetFilter(mode: "search" | "selection"): void {
+        const srcIdx = (mode === "search")
+            ? this.filteredOrigIdx.slice()
+            : Array.from(this.selectedOrigIdx);
+
+        if (srcIdx.length === 0) {
             this.removeFilter();
             return;
         }
         // SelectionId ベースで正確な行をクロスフィルター（同一ページ内）
-        const ids = Array.from(this.selectedOrigIdx)
+        const ids = srcIdx
             .filter(i => i < this.selectionIds.length)
             .map(i => this.selectionIds[i]);
         if (ids.length === 0) {
@@ -1097,7 +1106,7 @@ export class Visual implements IVisual {
         if (this.canUseAdvancedFilter()) {
             this.emitAdvancedFilterForSync();
         } else {
-            this.emitBasicFilterForSync();
+            this.emitBasicFilterForSync(srcIdx);
         }
     }
 
@@ -1263,12 +1272,12 @@ export class Visual implements IVisual {
         this.host.applyJsonFilter(filters, "general", "filter", FilterAction.merge);
     }
 
-    private emitBasicFilterForSync(): void {
+    private emitBasicFilterForSync(srcIdx: number[]): void {
         const dv = this.lastDataView;
         if (!dv?.table?.columns?.length) return;
 
         const cols = dv.table.columns;
-        const selArr = Array.from(this.selectedOrigIdx);
+        const selArr = srcIdx;
         if (selArr.length === 0) return;
 
         // 全列に対して BasicFilter を生成（他ページのスライサー/テーブルの絞り込み精度を最大化）
@@ -1566,9 +1575,15 @@ export class Visual implements IVisual {
             this.statusBar.appendChild(document.createTextNode(countText));
         }
 
-        if (this.selectedOrigIdx.size > 0) {
+        const searchActive = this.appliedConditions.some(c => isConditionActive(c, this.tableData.types));
+        const selSize = this.selectedOrigIdx.size;
+        if (searchActive && selSize === 0) {
+            // 検索中で未選択: 一致件数は countText で既に表示済み。追加表示なし。
+        } else if (selSize > 0) {
             const info = this.el("span", "sel-info");
-            info.textContent = `　${this.selectedOrigIdx.size} 件選択中`;
+            info.textContent = searchActive
+                ? `　${selSize} 件選択`
+                : `　${selSize} 件選択中`;
             this.statusBar.appendChild(info);
             const clr = this.el("button", "clear-sel-btn");
             clr.textContent = "選択解除";
