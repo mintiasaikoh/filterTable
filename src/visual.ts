@@ -634,6 +634,8 @@ export class Visual implements IVisual {
         this.applyDatasetFilter();
         // 選択行を最上位へ並べ替え直す
         this.runFilter();
+        // 並べ替えた結果を実際に見える位置（最上段）へスクロールリセット
+        if (this.scrollEl) this.scrollEl.scrollTop = 0;
         this.renderTableHeader();
         this.renderVirtualRows();
         this.renderStatus();
