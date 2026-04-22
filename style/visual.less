@@ -176,12 +176,13 @@
 
                     .col-resize-handle {
                         position: absolute;
-                        top: 0; right: -3px;
-                        width: 6px; height: 100%;
+                        top: 0; right: 0;
+                        width: 8px; height: 100%;
                         cursor: col-resize;
-                        z-index: 2;
+                        z-index: 3;
+                        user-select: none;
                         &:hover, &:active {
-                            background: rgba(0, 120, 212, 0.3);
+                            background: rgba(0, 120, 212, 0.35);
                         }
                     }
                 }
