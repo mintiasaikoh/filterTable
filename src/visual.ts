@@ -25,32 +25,46 @@ import {
     normalizeValue, filterSignature, buildFilterTarget,
 } from "./filterEngine";
 
+interface PoolRow {
+    tr: HTMLTableRowElement;
+    cb: HTMLInputElement;
+    cells: HTMLTableCellElement[];
+    oi: number; // -1 if unbound
+}
+
+const BUFFER_ROWS = 6;
+
 export class Visual implements IVisual {
     private host: IVisualHost;
     private formattingSettings: VisualFormattingSettingsModel;
     private formattingSettingsService: FormattingSettingsService;
 
-    // ---- データ ----
     private tableData: TableData = { columns: [], rows: [], rawRows: [] };
     private selectedOrigIdx = new Set<number>();
-    // SelectionId は必要になった時だけ生成してキャッシュ
     private selectionIdCache = new Map<number, ISelectionId>();
     private selectionManager: ISelectionManager;
     private lastDataView: DataView | null = null;
     private lastFilterJson = "";
     private prevColKey = "";
 
-    // ---- DOM ----
+    // DOM
     private rootEl: HTMLElement;
     private statusBar: HTMLElement;
     private tableScroll: HTMLElement;
     private table: HTMLTableElement;
     private thead: HTMLTableSectionElement;
     private tbody: HTMLTableSectionElement;
+    private topSpacer: HTMLTableRowElement;
+    private bottomSpacer: HTMLTableRowElement;
     private headerCb: HTMLInputElement | null = null;
-    private rowNodes = new Map<number, { tr: HTMLTableRowElement; cb: HTMLInputElement }>();
 
-    // ---- 制御 ----
+    // 仮想スクロール
+    private pool: PoolRow[] = [];
+    private poolColCount = -1; // 現在プール行が持っているセル数
+    private rowHeight = 24;
+    private scrollRaf: number | null = null;
+
+    // 制御
     private hasAppliedFilter = false;
     private isLoadingMore = false;
     private dataLimitReached = false;
@@ -83,6 +97,8 @@ export class Visual implements IVisual {
 
         this.rootEl.appendChild(this.statusBar);
         this.rootEl.appendChild(this.tableScroll);
+
+        this.tableScroll.addEventListener("scroll", () => this.onScroll(), { passive: true });
     }
 
     // ==========================================================
@@ -92,8 +108,15 @@ export class Visual implements IVisual {
         this.formattingSettings = this.formattingSettingsService
             .populateFormattingSettingsModel(VisualFormattingSettingsModel, options.dataViews?.[0]);
 
+        if (options.type & VisualUpdateType.Resize) {
+            this.renderVirtual();
+        }
+
         if (!(options.type & VisualUpdateType.Data)) {
-            if (options.type & VisualUpdateType.Style) this.applyStyles();
+            if (options.type & VisualUpdateType.Style) {
+                this.applyStyles();
+                this.renderVirtual();
+            }
             return;
         }
 
@@ -119,15 +142,16 @@ export class Visual implements IVisual {
             this.dataLimitReached = false;
         }
 
-        // 中間チャンクは status だけ更新
         if (isSegment && this.isLoadingMore) {
+            // 中間チャンクは下部 spacer だけ伸ばす（見えない領域なので）
+            this.updateSpacerHeights();
             this.renderStatus();
             return;
         }
 
-        // 列構成変化で選択状態リセット
         const colKey = this.tableData.columns.join("\0");
-        if (colKey !== this.prevColKey) {
+        const colsChanged = colKey !== this.prevColKey;
+        if (colsChanged) {
             this.prevColKey = colKey;
             this.selectedOrigIdx.clear();
             this.lastClickedOi = -1;
@@ -135,19 +159,20 @@ export class Visual implements IVisual {
             if (this.hasAppliedFilter) this.removeFilter();
         }
 
-        // 外部 jsonFilters から行選択を復元
         this.restoreFromJsonFilters(options.jsonFilters, dv);
 
-        // 範囲外 index を削除
         const max = this.tableData.rows.length;
         this.selectedOrigIdx.forEach(i => { if (i >= max) this.selectedOrigIdx.delete(i); });
 
         this.applyStyles();
-        this.renderAll();
+        this.renderHeader();
+        this.ensurePool();
+        this.renderVirtual();
+        this.renderStatus();
     }
 
     // ==========================================================
-    // データ抽出
+    // データ
     // ==========================================================
     private cellStr(v: PrimitiveValue): string {
         return v == null ? "" : String(v);
@@ -188,14 +213,8 @@ export class Visual implements IVisual {
     }
 
     // ==========================================================
-    // 描画
+    // ヘッダ描画
     // ==========================================================
-    private renderAll(): void {
-        this.renderHeader();
-        this.renderRows();
-        this.renderStatus();
-    }
-
     private renderHeader(): void {
         while (this.thead.firstChild) this.thead.removeChild(this.thead.firstChild);
         if (this.tableData.columns.length === 0) return;
@@ -219,58 +238,188 @@ export class Visual implements IVisual {
         this.refreshHeaderCb();
     }
 
-    private renderRows(): void {
-        while (this.tbody.firstChild) this.tbody.removeChild(this.tbody.firstChild);
-        this.rowNodes.clear();
+    // ==========================================================
+    // 行プール構築（仮想スクロールの肝）
+    // ==========================================================
+    private ensurePool(): void {
+        const colCount = this.tableData.columns.length;
 
-        const total = this.tableData.rows.length;
-        if (total === 0) {
-            const tr = document.createElement("tr");
-            const td = document.createElement("td");
-            td.className = "no-data";
-            td.colSpan = this.tableData.columns.length + 1;
-            td.textContent = this.tableData.columns.length === 0
-                ? "データをフィールドに追加してください"
-                : "該当するデータがありません";
-            tr.appendChild(td);
-            this.tbody.appendChild(tr);
+        // 列数が変わったらプール再構築
+        if (this.poolColCount !== colCount) {
+            while (this.tbody.firstChild) this.tbody.removeChild(this.tbody.firstChild);
+            this.pool = [];
+            this.poolColCount = colCount;
+
+            this.topSpacer = document.createElement("tr");
+            this.topSpacer.className = "spacer-row";
+            const topTd = document.createElement("td");
+            topTd.colSpan = colCount + 1;
+            this.topSpacer.appendChild(topTd);
+
+            this.bottomSpacer = document.createElement("tr");
+            this.bottomSpacer.className = "spacer-row";
+            const botTd = document.createElement("td");
+            botTd.colSpan = colCount + 1;
+            this.bottomSpacer.appendChild(botTd);
+
+            this.tbody.appendChild(this.topSpacer);
+            this.tbody.appendChild(this.bottomSpacer);
+        }
+
+        // no-data / empty の場合はプール不要
+        if (this.tableData.rows.length === 0 || colCount === 0) {
             return;
         }
 
-        const frag = document.createDocumentFragment();
-        for (let i = 0; i < total; i++) {
-            frag.appendChild(this.makeRow(i));
+        // プールサイズ = ビューポートに必要な行数 + バッファ。最小 20
+        const viewH = Math.max(this.tableScroll.clientHeight, 200);
+        const need = Math.ceil(viewH / this.rowHeight) + BUFFER_ROWS * 2;
+        const target = Math.max(20, need);
+
+        while (this.pool.length < target) {
+            this.pool.push(this.createPoolRow(colCount));
         }
-        this.tbody.appendChild(frag);
+        // プール行が多すぎたら末尾を削除
+        while (this.pool.length > target) {
+            const row = this.pool.pop();
+            if (row?.tr.parentElement) row.tr.remove();
+        }
     }
 
-    private makeRow(oi: number): HTMLTableRowElement {
-        const sel = this.selectedOrigIdx.has(oi);
+    private createPoolRow(colCount: number): PoolRow {
         const tr = document.createElement("tr");
-        tr.className = oi % 2 === 0 ? "row-even" : "row-odd";
-        if (sel) tr.classList.add("row-selected");
+        tr.style.display = "none";
+        tr.dataset.oi = "-1";
 
         const cbTd = document.createElement("td");
         cbTd.className = "cb-col";
         const cb = document.createElement("input");
         cb.type = "checkbox";
-        cb.checked = sel;
         cb.addEventListener("click", e => e.stopPropagation());
-        cb.addEventListener("change", () => this.onRowToggle(oi, cb.checked));
+        cb.addEventListener("change", () => {
+            const oi = Number(tr.dataset.oi);
+            if (oi >= 0) this.onRowToggle(oi, cb.checked);
+        });
         cbTd.appendChild(cb);
         tr.appendChild(cbTd);
 
-        tr.addEventListener("click", e => this.onRowClick(oi, e));
-
-        const row = this.tableData.rows[oi];
-        for (let ci = 0; ci < this.tableData.columns.length; ci++) {
+        const cells: HTMLTableCellElement[] = [];
+        for (let i = 0; i < colCount; i++) {
             const td = document.createElement("td");
-            td.textContent = row[ci] ?? "";
             tr.appendChild(td);
+            cells.push(td);
         }
 
-        this.rowNodes.set(oi, { tr, cb });
-        return tr;
+        tr.addEventListener("click", e => {
+            const oi = Number(tr.dataset.oi);
+            if (oi >= 0) this.onRowClick(oi, e);
+        });
+
+        // bottomSpacer の前に差し込む
+        this.tbody.insertBefore(tr, this.bottomSpacer);
+
+        return { tr, cb, cells, oi: -1 };
+    }
+
+    // ==========================================================
+    // 仮想スクロール描画
+    // ==========================================================
+    private onScroll(): void {
+        if (this.scrollRaf !== null) return;
+        this.scrollRaf = requestAnimationFrame(() => {
+            this.scrollRaf = null;
+            this.renderVirtual();
+        });
+    }
+
+    private updateSpacerHeights(): void {
+        const total = this.tableData.rows.length;
+        if (!this.topSpacer || !this.bottomSpacer) return;
+        // no-data 時は spacer 不要
+        if (total === 0) {
+            this.topSpacer.style.height = "0px";
+            this.bottomSpacer.style.height = "0px";
+        }
+    }
+
+    private renderVirtual(): void {
+        const total = this.tableData.rows.length;
+
+        // 空 or 列なし → no-data 行を表示
+        if (total === 0 || this.tableData.columns.length === 0) {
+            this.showNoDataRow();
+            return;
+        }
+        this.hideNoDataRow();
+
+        const rh = this.rowHeight;
+        const viewH = this.tableScroll.clientHeight;
+        const scrollTop = this.tableScroll.scrollTop;
+
+        const startRow = Math.max(0, Math.floor(scrollTop / rh) - BUFFER_ROWS);
+        const visCount = Math.min(total - startRow, this.pool.length);
+        const endRow = startRow + visCount;
+
+        this.topSpacer.style.height = (startRow * rh) + "px";
+        this.bottomSpacer.style.height = Math.max(0, (total - endRow) * rh) + "px";
+
+        for (let p = 0; p < this.pool.length; p++) {
+            const row = this.pool[p];
+            const oi = startRow + p;
+            if (p < visCount) {
+                this.bindRow(row, oi);
+            } else {
+                if (row.oi !== -1) {
+                    row.tr.style.display = "none";
+                    row.oi = -1;
+                }
+            }
+        }
+    }
+
+    private bindRow(row: PoolRow, oi: number): void {
+        const sel = this.selectedOrigIdx.has(oi);
+        row.tr.style.display = "";
+        row.tr.dataset.oi = String(oi);
+        row.oi = oi;
+        row.tr.className = (oi % 2 === 0 ? "row-even" : "row-odd") + (sel ? " row-selected" : "");
+        row.cb.checked = sel;
+
+        const data = this.tableData.rows[oi];
+        for (let c = 0; c < row.cells.length; c++) {
+            const txt = data[c] ?? "";
+            if (row.cells[c].textContent !== txt) row.cells[c].textContent = txt;
+        }
+    }
+
+    private showNoDataRow(): void {
+        // プールを全て非表示、spacer も 0 にし no-data 行だけ出す
+        this.pool.forEach(r => { r.tr.style.display = "none"; r.oi = -1; });
+        if (this.topSpacer) this.topSpacer.style.height = "0px";
+        if (this.bottomSpacer) this.bottomSpacer.style.height = "0px";
+
+        // 既存 no-data 行があれば使い回す
+        let nd = this.tbody.querySelector(".no-data-row") as HTMLTableRowElement | null;
+        if (!nd) {
+            nd = document.createElement("tr");
+            nd.className = "no-data-row";
+            const td = document.createElement("td");
+            td.className = "no-data";
+            td.colSpan = Math.max(1, this.tableData.columns.length + 1);
+            nd.appendChild(td);
+            if (this.bottomSpacer) this.tbody.insertBefore(nd, this.bottomSpacer);
+            else this.tbody.appendChild(nd);
+        }
+        const td = nd.firstChild as HTMLTableCellElement;
+        td.colSpan = Math.max(1, this.tableData.columns.length + 1);
+        td.textContent = this.tableData.columns.length === 0
+            ? "データをフィールドに追加してください"
+            : "該当するデータがありません";
+    }
+
+    private hideNoDataRow(): void {
+        const nd = this.tbody.querySelector(".no-data-row");
+        if (nd) nd.remove();
     }
 
     // ==========================================================
@@ -308,7 +457,7 @@ export class Visual implements IVisual {
         }
 
         this.lastClickedOi = oi;
-        this.refreshRowsUI(changed);
+        this.refreshVisibleSelection(changed);
         this.commitSelection();
     }
 
@@ -316,7 +465,7 @@ export class Visual implements IVisual {
         if (checked) this.selectedOrigIdx.add(oi);
         else this.selectedOrigIdx.delete(oi);
         this.lastClickedOi = oi;
-        this.refreshRowsUI(new Set([oi]));
+        this.refreshVisibleSelection(new Set([oi]));
         this.commitSelection();
     }
 
@@ -324,36 +473,36 @@ export class Visual implements IVisual {
         const total = this.tableData.rows.length;
         if (total === 0) return;
         const allSel = this.selectedOrigIdx.size === total;
-        const changed = new Set<number>();
-        if (allSel) {
-            this.selectedOrigIdx.forEach(i => changed.add(i));
-            this.selectedOrigIdx.clear();
-        } else {
-            for (let i = 0; i < total; i++) {
-                if (!this.selectedOrigIdx.has(i)) {
-                    this.selectedOrigIdx.add(i);
-                    changed.add(i);
-                }
-            }
-        }
-        this.refreshRowsUI(changed);
+        if (allSel) this.selectedOrigIdx.clear();
+        else for (let i = 0; i < total; i++) this.selectedOrigIdx.add(i);
+        this.refreshAllVisibleSelection();
         this.commitSelection();
     }
 
     private clearSelection(): void {
-        const changed = new Set<number>(this.selectedOrigIdx);
         this.selectedOrigIdx.clear();
-        this.refreshRowsUI(changed);
+        this.refreshAllVisibleSelection();
         this.commitSelection();
     }
 
-    private refreshRowsUI(changedOi: Set<number>): void {
-        changedOi.forEach(oi => {
-            const node = this.rowNodes.get(oi);
-            if (!node) return;
-            const sel = this.selectedOrigIdx.has(oi);
-            node.tr.classList.toggle("row-selected", sel);
-            node.cb.checked = sel;
+    /** changed に含まれる oi のうち、プール上に表示されているものだけ DOM 同期 */
+    private refreshVisibleSelection(changed: Set<number>): void {
+        this.pool.forEach(row => {
+            if (row.oi < 0 || !changed.has(row.oi)) return;
+            const sel = this.selectedOrigIdx.has(row.oi);
+            row.tr.classList.toggle("row-selected", sel);
+            row.cb.checked = sel;
+        });
+        this.refreshHeaderCb();
+    }
+
+    /** 全選択/全解除など変更行が多い時はプール全体を走査 */
+    private refreshAllVisibleSelection(): void {
+        this.pool.forEach(row => {
+            if (row.oi < 0) return;
+            const sel = this.selectedOrigIdx.has(row.oi);
+            row.tr.classList.toggle("row-selected", sel);
+            row.cb.checked = sel;
         });
         this.refreshHeaderCb();
     }
@@ -361,10 +510,9 @@ export class Visual implements IVisual {
     private refreshHeaderCb(): void {
         if (!this.headerCb) return;
         const total = this.tableData.rows.length;
-        const allSel = total > 0 && this.selectedOrigIdx.size === total;
-        const someSel = !allSel && this.selectedOrigIdx.size > 0;
-        this.headerCb.checked = allSel;
-        this.headerCb.indeterminate = someSel;
+        const size = this.selectedOrigIdx.size;
+        this.headerCb.checked = total > 0 && size === total;
+        this.headerCb.indeterminate = size > 0 && size < total;
     }
 
     private commitSelection(): void {
@@ -386,18 +534,15 @@ export class Visual implements IVisual {
             const id = this.getSelectionId(i);
             if (id) ids.push(id);
         }
-        if (ids.length === 0) {
-            this.removeFilter();
-            return;
-        }
+        if (ids.length === 0) { this.removeFilter(); return; }
         this.hasAppliedFilter = true;
         this.selectionManager.select(ids);
 
         if (this.emitTimer !== null) clearTimeout(this.emitTimer);
-        this.emitTimer = window.setTimeout(() => this.flushEmit(srcIdx), 120);
+        this.emitTimer = window.setTimeout(() => this.flushEmit(), 120);
     }
 
-    private flushEmit(_snapshot: number[]): void {
+    private flushEmit(): void {
         this.emitTimer = null;
         const srcIdx = Array.from(this.selectedOrigIdx);
         if (srcIdx.length === 0) return;
@@ -426,7 +571,6 @@ export class Visual implements IVisual {
             filters.push(new BasicFilter(target, "In", ...rawValues));
             sigParts.push(filterSignature(target, Array.from(valueMap.keys())));
         }
-
         if (filters.length === 0) return;
         const key = "BASIC|" + sigParts.slice().sort().join("|");
         if (key === this.lastFilterJson) return;
@@ -549,8 +693,10 @@ export class Visual implements IVisual {
         s.setProperty("--val-bg", v.backgroundColor.value.value);
         s.setProperty("--val-alt-color", v.altFontColor.value.value);
         s.setProperty("--val-alt-bg", v.altBackgroundColor.value.value);
-        s.setProperty("--val-white-space", v.wordWrap.value ? "pre-line" : "nowrap");
-        s.setProperty("--val-row-height", Math.max(24, Math.round(vSize * 1.333 * 1.6 + 4)) + "px");
+
+        const rh = Math.max(24, Math.round(vSize * 1.333 * 1.6 + 4));
+        this.rowHeight = rh;
+        s.setProperty("--val-row-height", rh + "px");
 
         s.setProperty("--hdr-font-family", h.font.fontFamily.value);
         s.setProperty("--hdr-font-size", h.font.fontSize.value + "pt");
@@ -568,5 +714,6 @@ export class Visual implements IVisual {
 
     public destroy(): void {
         if (this.emitTimer !== null) { clearTimeout(this.emitTimer); this.emitTimer = null; }
+        if (this.scrollRaf !== null) { cancelAnimationFrame(this.scrollRaf); this.scrollRaf = null; }
     }
 }
