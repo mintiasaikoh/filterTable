@@ -27,15 +27,20 @@
             align-items: center;
             gap: 4px;
             margin-bottom: 6px;
+            flex-wrap: wrap;
 
             .filter-title { font-weight: 600; font-size: 13px; color: #605e5c; }
 
             .filter-help {
-                flex: 1;
+                flex: 1 1 auto;
+                min-width: 0;
                 font-size: 11px;
                 color: #a19f9d;
                 cursor: help;
                 user-select: none;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
                 &:hover { color: #0078d4; }
             }
         }
@@ -94,6 +99,7 @@
         padding: 3px 10px;
         font-size: 11px; color: #605e5c;
         background: #f0f0f0; border-bottom: 1px solid #e0e0e0;
+        flex-wrap: wrap;
 
         .sel-info { color: #0078d4; font-weight: 600; }
 
