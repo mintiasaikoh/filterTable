@@ -3,8 +3,7 @@
 import powerbi from "powerbi-visuals-api";
 import { FormattingSettingsService } from "powerbi-visuals-utils-formattingmodel";
 import {
-    BasicFilter, IFilterColumnTarget, IBasicFilter,
-    FilterType,
+    BasicFilter, IFilterColumnTarget, IBasicFilter, FilterType,
 } from "powerbi-models";
 import "./../style/visual.less";
 
@@ -18,7 +17,7 @@ import DataView                 = powerbi.DataView;
 import FilterAction             = powerbi.FilterAction;
 import VisualUpdateType         = powerbi.VisualUpdateType;
 import VisualDataChangeOperationKind = powerbi.VisualDataChangeOperationKind;
-import DataViewTable               = powerbi.DataViewTable;
+import DataViewTable            = powerbi.DataViewTable;
 
 import { VisualFormattingSettingsModel } from "./settings";
 import {
@@ -31,39 +30,32 @@ export class Visual implements IVisual {
     private formattingSettings: VisualFormattingSettingsModel;
     private formattingSettingsService: FormattingSettingsService;
 
-    // ---- データ状態 ----
-    private tableData: TableData                 = { columns: [], rows: [], rawRows: [] };
-    private sortedOrigIdx: number[]              = []; // ソート後の元行 index 配列（全行）
-    private selectedOrigIdx: Set<number>         = new Set();
-    private rowNodes: Map<number, HTMLTableRowElement> = new Map(); // oi -> tr
-    private selectionIds: ISelectionId[]         = [];
+    // ---- データ ----
+    private tableData: TableData = { columns: [], rows: [], rawRows: [] };
+    private selectedOrigIdx = new Set<number>();
+    // SelectionId は必要になった時だけ生成してキャッシュ
+    private selectionIdCache = new Map<number, ISelectionId>();
     private selectionManager: ISelectionManager;
-    private lastDataView: DataView | null        = null;
-    private lastFilterJson = ""; // BasicFilter 自己発火検出
-    private activeColTab  = -1;
-    private prevColKey    = "";
+    private lastDataView: DataView | null = null;
+    private lastFilterJson = "";
+    private prevColKey = "";
 
     // ---- DOM ----
-    private colToggleBar: HTMLElement;
-    private statusBar:    HTMLElement;
-    private tableWrapper: HTMLElement;
-    private scrollEl:     HTMLElement;
-    private table:        HTMLTableElement;
-    private colGroup:     HTMLElement;
-    private thead:        HTMLTableSectionElement;
-    private tbody:        HTMLTableSectionElement;
+    private rootEl: HTMLElement;
+    private statusBar: HTMLElement;
+    private tableScroll: HTMLElement;
+    private table: HTMLTableElement;
+    private thead: HTMLTableSectionElement;
+    private tbody: HTMLTableSectionElement;
+    private headerCb: HTMLInputElement | null = null;
+    private rowNodes = new Map<number, { tr: HTMLTableRowElement; cb: HTMLInputElement }>();
 
-    // ---- 制御フラグ ----
-    private hasInteracted     = false;
-    private hasAppliedFilter  = false;
-    private isLoadingMore     = false;
-    private dataLimitReached  = false;
+    // ---- 制御 ----
+    private hasAppliedFilter = false;
+    private isLoadingMore = false;
+    private dataLimitReached = false;
     private emitTimer: number | null = null;
-    private rootEl:       HTMLElement;
-    private colWidths: Map<number, number> = new Map();
-    private sortColIdx = -1;
-    private sortDir: "asc" | "desc" | null = null;
-    private lastClickedRi = -1;
+    private lastClickedOi = -1;
 
     constructor(options: VisualConstructorOptions) {
         this.host = options.host;
@@ -71,37 +63,26 @@ export class Visual implements IVisual {
         this.formattingSettingsService = new FormattingSettingsService();
         this.rootEl = options.element;
         this.rootEl.className = "filter-table-visual";
-        this.buildDOM(this.rootEl);
+        this.buildDOM();
     }
 
-    private buildDOM(root: HTMLElement): void {
-        this.colToggleBar = this.el("div", "col-toggle-bar");
-        this.statusBar    = this.el("div", "status-bar");
-        this.tableWrapper = this.el("div", "table-wrapper");
-        this.scrollEl     = this.el("div", "table-scroll");
-        this.table        = this.el("table", "data-table") as HTMLTableElement;
-        this.colGroup     = this.el("colgroup", "");
-        this.thead        = this.el("thead", "") as HTMLTableSectionElement;
-        this.tbody        = this.el("tbody", "") as HTMLTableSectionElement;
+    private buildDOM(): void {
+        this.statusBar = document.createElement("div");
+        this.statusBar.className = "status-bar";
 
-        this.table.appendChild(this.colGroup);
+        this.tableScroll = document.createElement("div");
+        this.tableScroll.className = "table-scroll";
+
+        this.table = document.createElement("table");
+        this.table.className = "data-table";
+        this.thead = document.createElement("thead");
+        this.tbody = document.createElement("tbody");
         this.table.appendChild(this.thead);
         this.table.appendChild(this.tbody);
-        this.scrollEl.appendChild(this.table);
-        this.tableWrapper.appendChild(this.scrollEl);
+        this.tableScroll.appendChild(this.table);
 
-        [this.colToggleBar, this.statusBar, this.tableWrapper]
-            .forEach(e => root.appendChild(e));
-    }
-
-    private el<K extends keyof HTMLElementTagNameMap>(tag: K, cls: string): HTMLElementTagNameMap[K] {
-        const e = document.createElement(tag);
-        if (cls) e.className = cls;
-        return e;
-    }
-
-    private clear(el: HTMLElement): void {
-        while (el.firstChild) el.removeChild(el.firstChild);
+        this.rootEl.appendChild(this.statusBar);
+        this.rootEl.appendChild(this.tableScroll);
     }
 
     // ==========================================================
@@ -111,27 +92,22 @@ export class Visual implements IVisual {
         this.formattingSettings = this.formattingSettingsService
             .populateFormattingSettingsModel(VisualFormattingSettingsModel, options.dataViews?.[0]);
 
-        const hasResize = !!(options.type & VisualUpdateType.Resize);
-        const hasDataOrStyle = !!(options.type & (VisualUpdateType.Data | VisualUpdateType.Style));
-        if (hasResize && !hasDataOrStyle) return;
-
         if (!(options.type & VisualUpdateType.Data)) {
-            if (options.type & VisualUpdateType.Style) {
-                this.applyTableStyles();
-            }
+            if (options.type & VisualUpdateType.Style) this.applyStyles();
             return;
         }
 
-        const dv: DataView = options.dataViews?.[0];
-        this.lastDataView = dv;
+        const dv = options.dataViews?.[0];
+        this.lastDataView = dv ?? null;
 
         const isSegment = options.operationKind === VisualDataChangeOperationKind.Segment;
         const hasMoreSegments = !!(dv?.metadata?.segment);
 
         if (isSegment && dv?.table) {
-            this.appendIncrementalData(dv.table);
+            this.appendIncremental(dv.table);
         } else {
-            this.tableData = this.extractTableData(dv);
+            this.tableData = this.extractTable(dv);
+            this.selectionIdCache.clear();
         }
 
         if (hasMoreSegments) {
@@ -143,327 +119,209 @@ export class Visual implements IVisual {
             this.dataLimitReached = false;
         }
 
+        // 中間チャンクは status だけ更新
         if (isSegment && this.isLoadingMore) {
-            // 中間チャンクは status のみ更新
             this.renderStatus();
             return;
         }
 
-        // --- 列変化検知 ---
+        // 列構成変化で選択状態リセット
         const colKey = this.tableData.columns.join("\0");
-        const colsChanged = colKey !== this.prevColKey;
-        this.prevColKey = colKey;
-        if (colsChanged) {
-            this.activeColTab = -1;
-            this.colWidths.clear();
-            this.sortColIdx = -1;
-            this.sortDir = null;
-            this.lastClickedRi = -1;
+        if (colKey !== this.prevColKey) {
+            this.prevColKey = colKey;
+            this.selectedOrigIdx.clear();
+            this.lastClickedOi = -1;
             this.lastFilterJson = "";
             if (this.hasAppliedFilter) this.removeFilter();
-            this.selectedOrigIdx.clear();
         }
 
-        const isFirstLoad = !this.hasInteracted;
-
-        // jsonFilters から行選択を毎回再構築
+        // 外部 jsonFilters から行選択を復元
         this.restoreFromJsonFilters(options.jsonFilters, dv);
 
-        // 範囲外インデックスを除去
-        const maxIdx = this.tableData.rows.length;
-        this.selectedOrigIdx.forEach(i => { if (i >= maxIdx) this.selectedOrigIdx.delete(i); });
-        if (this.selectedOrigIdx.size === 0 && this.hasAppliedFilter) {
-            this.removeFilter();
-        }
+        // 範囲外 index を削除
+        const max = this.tableData.rows.length;
+        this.selectedOrigIdx.forEach(i => { if (i >= max) this.selectedOrigIdx.delete(i); });
 
-        if (isFirstLoad) {
-            this.scrollEl.scrollTop = 0;
-        }
-
-        // --- レンダリング ---
-        this.applySort();
-        this.renderColToggleBar();
-        this.applyTableStyles();
-        this.renderTableHeader();
-        this.renderAllRows();
-        this.renderStatus();
+        this.applyStyles();
+        this.renderAll();
     }
 
-    private cellToString(v: PrimitiveValue): string {
+    // ==========================================================
+    // データ抽出
+    // ==========================================================
+    private cellStr(v: PrimitiveValue): string {
         return v == null ? "" : String(v);
     }
 
-    private extractTableData(dv: DataView): TableData {
-        if (!dv?.table) { this.selectionIds = []; return { columns: [], rows: [], rawRows: [] }; }
-        this.selectionIds = dv.table.rows.map((_, i) =>
-            this.host.createSelectionIdBuilder().withTable(dv.table, i).createSelectionId()
-        );
+    private extractTable(dv: DataView | undefined): TableData {
+        if (!dv?.table) return { columns: [], rows: [], rawRows: [] };
         return {
             columns: dv.table.columns.map(c => c.displayName || ""),
-            rows:    dv.table.rows.map(r => r.map(c => this.cellToString(c as PrimitiveValue))),
+            rows:    dv.table.rows.map(r => r.map(c => this.cellStr(c as PrimitiveValue))),
             rawRows: dv.table.rows.map(r => r.map(c => (c == null ? null : c)) as PrimitiveValue[]),
         };
     }
 
-    private appendIncrementalData(table: DataViewTable): void {
+    private appendIncremental(table: DataViewTable): void {
         const offset = (table as unknown as Record<string, unknown>)["lastMergeIndex"] as number | undefined;
         const startIdx = (offset === undefined) ? 0 : offset + 1;
-
         if (this.tableData.columns.length === 0) {
             this.tableData.columns = table.columns.map(c => c.displayName || "");
         }
-
         for (let i = startIdx; i < table.rows.length; i++) {
-            this.tableData.rows.push(table.rows[i].map(c => this.cellToString(c as PrimitiveValue)));
+            this.tableData.rows.push(table.rows[i].map(c => this.cellStr(c as PrimitiveValue)));
             this.tableData.rawRows.push(table.rows[i].map(c => (c == null ? null : c)) as PrimitiveValue[]);
-            this.selectionIds.push(
-                this.host.createSelectionIdBuilder().withTable(table, i).createSelectionId()
-            );
         }
     }
 
-    // ==========================================================
-    // 列トグルバー（タブ動作）
-    // ==========================================================
-    private renderColToggleBar(): void {
-        this.clear(this.colToggleBar);
-        const multi = this.tableData.columns.length > 1;
-        this.colToggleBar.style.display = multi ? "flex" : "none";
-        if (!multi) return;
-
-        const allChip = this.el("button", "col-chip" + (this.activeColTab === -1 ? " active" : ""));
-        allChip.textContent = "全列";
-        allChip.onclick = () => this.switchColTab(-1);
-        this.colToggleBar.appendChild(allChip);
-
-        this.tableData.columns.forEach((col, i) => {
-            const chip = this.el("button", "col-chip" + (this.activeColTab === i ? " active" : ""));
-            chip.textContent = col;
-            chip.onclick = () => this.switchColTab(i);
-            this.colToggleBar.appendChild(chip);
-        });
-    }
-
-    private switchColTab(idx: number): void {
-        if (this.activeColTab === idx) return;
-        this.activeColTab = idx;
-        this.renderColToggleBar();
-        this.renderTableHeader();
-        this.renderAllRows();
-    }
-
-    private isColVisible(i: number): boolean {
-        return this.activeColTab === -1 || this.activeColTab === i;
+    private getSelectionId(origIdx: number): ISelectionId | null {
+        const dv = this.lastDataView;
+        if (!dv?.table) return null;
+        let id = this.selectionIdCache.get(origIdx);
+        if (!id) {
+            id = this.host.createSelectionIdBuilder()
+                .withTable(dv.table, origIdx)
+                .createSelectionId();
+            this.selectionIdCache.set(origIdx, id);
+        }
+        return id;
     }
 
     // ==========================================================
-    // ソート
+    // 描画
     // ==========================================================
-    private applySort(): void {
-        const n = this.tableData.rows.length;
-        this.sortedOrigIdx = new Array(n);
-        for (let i = 0; i < n; i++) this.sortedOrigIdx[i] = i;
-
-        if (this.sortColIdx < 0 || !this.sortDir) return;
-        const ci = this.sortColIdx;
-        const dir = this.sortDir === "asc" ? 1 : -1;
-
-        const keyOf = (oi: number): number | string => {
-            const raw = this.tableData.rawRows[oi]?.[ci];
-            if (raw == null) return "";
-            if (raw instanceof Date) return raw.getTime();
-            if (typeof raw === "number") return raw;
-            if (typeof raw === "boolean") return raw ? 1 : 0;
-            const s = String(raw);
-            const nu = Number(s);
-            return (s !== "" && !isNaN(nu)) ? nu : s;
-        };
-
-        this.sortedOrigIdx.sort((a, b) => {
-            const ka = keyOf(a);
-            const kb = keyOf(b);
-            if (typeof ka === "number" && typeof kb === "number") return (ka - kb) * dir;
-            return String(ka).localeCompare(String(kb), undefined, { numeric: true }) * dir;
-        });
+    private renderAll(): void {
+        this.renderHeader();
+        this.renderRows();
+        this.renderStatus();
     }
 
-    // ==========================================================
-    // テーブル描画（全行一括 / ブラウザ標準スクロール）
-    // ==========================================================
-    private renderTableHeader(): void {
-        this.clear(this.colGroup);
-        this.clear(this.thead);
-        if (!this.tableData.columns.length) return;
+    private renderHeader(): void {
+        while (this.thead.firstChild) this.thead.removeChild(this.thead.firstChild);
+        if (this.tableData.columns.length === 0) return;
 
-        const cbCol = this.el("col", ""); cbCol.style.width = "32px";
-        this.colGroup.appendChild(cbCol);
-        this.tableData.columns.forEach((_, i) => {
-            if (!this.isColVisible(i)) return;
-            const col = this.el("col", "");
-            const w = this.colWidths.get(i);
-            if (w) col.style.width = w + "px";
-            this.colGroup.appendChild(col);
-        });
+        const tr = document.createElement("tr");
 
-        const tr = this.el("tr", "");
-
-        const cbTh = this.el("th", "cb-col");
-        const total = this.sortedOrigIdx.length;
-        const allSel = total > 0 && this.selectedOrigIdx.size === total;
-        const someSel = !allSel && this.selectedOrigIdx.size > 0;
-        const allCb = this.el("input", "") as HTMLInputElement;
-        allCb.type = "checkbox"; allCb.checked = allSel; allCb.indeterminate = someSel;
-        allCb.onchange = () => this.toggleSelectAll();
-        cbTh.appendChild(allCb);
+        const cbTh = document.createElement("th");
+        cbTh.className = "cb-col";
+        this.headerCb = document.createElement("input");
+        this.headerCb.type = "checkbox";
+        this.headerCb.onchange = () => this.toggleSelectAll();
+        cbTh.appendChild(this.headerCb);
         tr.appendChild(cbTh);
 
-        this.tableData.columns.forEach((col, i) => {
-            if (!this.isColVisible(i)) return;
-            const th = this.el("th", "");
-
-            const label = this.el("span", "col-label");
-            label.textContent = col;
-            th.appendChild(label);
-
-            const arrow = this.el("span", "sort-indicator");
-            if (this.sortColIdx === i && this.sortDir === "asc")  arrow.textContent = " ▲";
-            else if (this.sortColIdx === i && this.sortDir === "desc") arrow.textContent = " ▼";
-            else arrow.textContent = " △";
-            th.appendChild(arrow);
-
-            th.addEventListener("click", (e) => {
-                if ((e.target as HTMLElement).classList.contains("col-resize-handle")) return;
-                if (this.sortColIdx === i) {
-                    this.sortDir = this.sortDir === "asc" ? "desc" : this.sortDir === "desc" ? null : "asc";
-                    if (!this.sortDir) this.sortColIdx = -1;
-                } else {
-                    this.sortColIdx = i;
-                    this.sortDir = "asc";
-                }
-                this.lastClickedRi = -1;
-                this.applySort();
-                this.renderTableHeader();
-                this.renderAllRows();
-            });
-
-            const handle = this.el("div", "col-resize-handle");
-            handle.addEventListener("mousedown", (e) => this.onColResizeStart(e, i));
-            th.appendChild(handle);
-
+        this.tableData.columns.forEach(col => {
+            const th = document.createElement("th");
+            th.textContent = col;
             tr.appendChild(th);
         });
         this.thead.appendChild(tr);
-
-        if (this.colWidths.size > 0) {
-            let total = 32;
-            this.tableData.columns.forEach((_, i) => {
-                if (!this.isColVisible(i)) return;
-                total += this.colWidths.get(i) || 120;
-            });
-            this.table.style.width = total + "px";
-        } else {
-            this.table.style.width = "";
-        }
+        this.refreshHeaderCb();
     }
 
-    private renderAllRows(): void {
-        this.clear(this.tbody);
+    private renderRows(): void {
+        while (this.tbody.firstChild) this.tbody.removeChild(this.tbody.firstChild);
         this.rowNodes.clear();
 
-        const total = this.sortedOrigIdx.length;
+        const total = this.tableData.rows.length;
         if (total === 0) {
-            const tr = this.el("tr", ""); const td = this.el("td", "no-data") as HTMLTableCellElement;
-            const visCols = this.tableData.columns.filter((_, i) => this.isColVisible(i)).length;
-            td.colSpan = visCols + 1;
+            const tr = document.createElement("tr");
+            const td = document.createElement("td");
+            td.className = "no-data";
+            td.colSpan = this.tableData.columns.length + 1;
             td.textContent = this.tableData.columns.length === 0
                 ? "データをフィールドに追加してください"
                 : "該当するデータがありません";
-            tr.appendChild(td); this.tbody.appendChild(tr);
+            tr.appendChild(td);
+            this.tbody.appendChild(tr);
             return;
         }
 
         const frag = document.createDocumentFragment();
-        for (let ri = 0; ri < total; ri++) {
-            frag.appendChild(this.makeDataRow(ri));
+        for (let i = 0; i < total; i++) {
+            frag.appendChild(this.makeRow(i));
         }
         this.tbody.appendChild(frag);
     }
 
-    private makeDataRow(ri: number): HTMLTableRowElement {
-        const oi  = this.sortedOrigIdx[ri];
+    private makeRow(oi: number): HTMLTableRowElement {
         const sel = this.selectedOrigIdx.has(oi);
-        const tr  = this.el("tr", ri % 2 === 0 ? "row-even" : "row-odd") as HTMLTableRowElement;
-        tr.dataset.ri = String(ri);
+        const tr = document.createElement("tr");
+        tr.className = oi % 2 === 0 ? "row-even" : "row-odd";
         if (sel) tr.classList.add("row-selected");
 
-        const cbTd = this.el("td", "cb-col") as HTMLTableCellElement;
-        const cb   = this.el("input", "") as HTMLInputElement;
-        cb.type = "checkbox"; cb.checked = sel;
-        cb.addEventListener("click", (ev) => { ev.preventDefault(); });
-        cbTd.appendChild(cb); tr.appendChild(cbTd);
+        const cbTd = document.createElement("td");
+        cbTd.className = "cb-col";
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = sel;
+        cb.addEventListener("click", e => e.stopPropagation());
+        cb.addEventListener("change", () => this.onRowToggle(oi, cb.checked));
+        cbTd.appendChild(cb);
+        tr.appendChild(cbTd);
 
-        tr.addEventListener("click", (e) => {
-            this.handleRowClick(ri, e);
-        });
+        tr.addEventListener("click", e => this.onRowClick(oi, e));
 
         const row = this.tableData.rows[oi];
-        this.tableData.columns.forEach((_, i) => {
-            if (!this.isColVisible(i)) return;
-            const td = this.el("td", i === 0 ? "first-data-col" : "") as HTMLTableCellElement;
-            td.textContent = row[i] ?? "";
+        for (let ci = 0; ci < this.tableData.columns.length; ci++) {
+            const td = document.createElement("td");
+            td.textContent = row[ci] ?? "";
             tr.appendChild(td);
-        });
+        }
 
-        this.rowNodes.set(oi, tr);
+        this.rowNodes.set(oi, { tr, cb });
         return tr;
     }
 
     // ==========================================================
     // 選択
     // ==========================================================
-    private handleRowClick(ri: number, e: MouseEvent): void {
-        if (ri >= this.sortedOrigIdx.length) return;
-        const oi = this.sortedOrigIdx[ri];
+    private onRowClick(oi: number, e: MouseEvent): void {
         const ctrlOrMeta = e.ctrlKey || e.metaKey;
-
         const changed = new Set<number>();
-        const markChange = (i: number) => changed.add(i);
 
-        if (e.shiftKey && this.lastClickedRi >= 0) {
-            const from = Math.min(this.lastClickedRi, ri);
-            const to   = Math.max(this.lastClickedRi, ri);
+        if (e.shiftKey && this.lastClickedOi >= 0) {
+            const from = Math.min(this.lastClickedOi, oi);
+            const to   = Math.max(this.lastClickedOi, oi);
             if (!ctrlOrMeta) {
-                this.selectedOrigIdx.forEach(i => markChange(i));
+                this.selectedOrigIdx.forEach(i => changed.add(i));
                 this.selectedOrigIdx.clear();
             }
-            for (let r = from; r <= to; r++) {
-                const i = this.sortedOrigIdx[r];
+            for (let i = from; i <= to; i++) {
                 if (!this.selectedOrigIdx.has(i)) {
                     this.selectedOrigIdx.add(i);
-                    markChange(i);
+                    changed.add(i);
                 }
             }
         } else if (ctrlOrMeta) {
             if (this.selectedOrigIdx.has(oi)) this.selectedOrigIdx.delete(oi);
             else this.selectedOrigIdx.add(oi);
-            markChange(oi);
+            changed.add(oi);
         } else {
             const onlyThis = this.selectedOrigIdx.size === 1 && this.selectedOrigIdx.has(oi);
-            this.selectedOrigIdx.forEach(i => markChange(i));
+            this.selectedOrigIdx.forEach(i => changed.add(i));
             this.selectedOrigIdx.clear();
             if (!onlyThis) {
                 this.selectedOrigIdx.add(oi);
-                markChange(oi);
+                changed.add(oi);
             }
         }
 
-        this.lastClickedRi = ri;
-        this.updateRowsUI(changed);
+        this.lastClickedOi = oi;
+        this.refreshRowsUI(changed);
+        this.commitSelection();
+    }
+
+    private onRowToggle(oi: number, checked: boolean): void {
+        if (checked) this.selectedOrigIdx.add(oi);
+        else this.selectedOrigIdx.delete(oi);
+        this.lastClickedOi = oi;
+        this.refreshRowsUI(new Set([oi]));
         this.commitSelection();
     }
 
     private toggleSelectAll(): void {
-        const total = this.sortedOrigIdx.length;
+        const total = this.tableData.rows.length;
         if (total === 0) return;
         const allSel = this.selectedOrigIdx.size === total;
         const changed = new Set<number>();
@@ -471,63 +329,63 @@ export class Visual implements IVisual {
             this.selectedOrigIdx.forEach(i => changed.add(i));
             this.selectedOrigIdx.clear();
         } else {
-            for (const i of this.sortedOrigIdx) {
+            for (let i = 0; i < total; i++) {
                 if (!this.selectedOrigIdx.has(i)) {
                     this.selectedOrigIdx.add(i);
                     changed.add(i);
                 }
             }
         }
-        this.updateRowsUI(changed);
+        this.refreshRowsUI(changed);
         this.commitSelection();
     }
 
     private clearSelection(): void {
         const changed = new Set<number>(this.selectedOrigIdx);
         this.selectedOrigIdx.clear();
-        this.updateRowsUI(changed);
+        this.refreshRowsUI(changed);
         this.commitSelection();
     }
 
-    /** 指定 oi の行だけ class/checkbox を更新 + header allSelect 状態を更新 */
-    private updateRowsUI(changedOi: Set<number>): void {
+    private refreshRowsUI(changedOi: Set<number>): void {
         changedOi.forEach(oi => {
-            const tr = this.rowNodes.get(oi);
-            if (!tr) return;
+            const node = this.rowNodes.get(oi);
+            if (!node) return;
             const sel = this.selectedOrigIdx.has(oi);
-            tr.classList.toggle("row-selected", sel);
-            const cb = tr.querySelector("input") as HTMLInputElement;
-            if (cb) cb.checked = sel;
+            node.tr.classList.toggle("row-selected", sel);
+            node.cb.checked = sel;
         });
-        const allCb = this.thead.querySelector("input") as HTMLInputElement;
-        if (allCb) {
-            const total = this.sortedOrigIdx.length;
-            const allSel = total > 0 && this.selectedOrigIdx.size === total;
-            const someSel = !allSel && this.selectedOrigIdx.size > 0;
-            allCb.checked = allSel;
-            allCb.indeterminate = someSel;
-        }
+        this.refreshHeaderCb();
+    }
+
+    private refreshHeaderCb(): void {
+        if (!this.headerCb) return;
+        const total = this.tableData.rows.length;
+        const allSel = total > 0 && this.selectedOrigIdx.size === total;
+        const someSel = !allSel && this.selectedOrigIdx.size > 0;
+        this.headerCb.checked = allSel;
+        this.headerCb.indeterminate = someSel;
     }
 
     private commitSelection(): void {
-        this.hasInteracted = true;
         this.applyDatasetFilter();
         this.renderStatus();
     }
 
-    /**
-     * 選択行の値で BasicFilter を発火（全列）+ SelectionManager（同ページ）
-     * 連続クリックに備えて applyJsonFilter は 150ms デバウンス。
-     */
+    // ==========================================================
+    // フィルター発火
+    // ==========================================================
     private applyDatasetFilter(): void {
         const srcIdx = Array.from(this.selectedOrigIdx);
         if (srcIdx.length === 0) {
             this.removeFilter();
             return;
         }
-        const ids = srcIdx
-            .filter(i => i < this.selectionIds.length)
-            .map(i => this.selectionIds[i]);
+        const ids: ISelectionId[] = [];
+        for (const i of srcIdx) {
+            const id = this.getSelectionId(i);
+            if (id) ids.push(id);
+        }
         if (ids.length === 0) {
             this.removeFilter();
             return;
@@ -536,20 +394,19 @@ export class Visual implements IVisual {
         this.selectionManager.select(ids);
 
         if (this.emitTimer !== null) clearTimeout(this.emitTimer);
-        this.emitTimer = window.setTimeout(() => this.flushJsonFilterEmit(srcIdx), 150);
+        this.emitTimer = window.setTimeout(() => this.flushEmit(srcIdx), 120);
     }
 
-    private flushJsonFilterEmit(_snapshotSrc: number[]): void {
+    private flushEmit(_snapshot: number[]): void {
         this.emitTimer = null;
         const srcIdx = Array.from(this.selectedOrigIdx);
         if (srcIdx.length === 0) return;
-        this.emitBasicFilterForSync(srcIdx);
+        this.emitBasicFilter(srcIdx);
     }
 
-    private emitBasicFilterForSync(srcIdx: number[]): void {
+    private emitBasicFilter(srcIdx: number[]): void {
         const dv = this.lastDataView;
         if (!dv?.table?.columns?.length) return;
-
         const cols = dv.table.columns;
         const filters: BasicFilter[] = [];
         const sigParts: string[] = [];
@@ -557,7 +414,6 @@ export class Visual implements IVisual {
         for (let ci = 0; ci < cols.length; ci++) {
             const target = buildFilterTarget(cols[ci]);
             if (!target) continue;
-
             const valueMap = new Map<string, FilterValue>();
             for (const i of srcIdx) {
                 const raw = this.tableData.rawRows[i]?.[ci];
@@ -566,17 +422,14 @@ export class Visual implements IVisual {
                 if (!valueMap.has(key)) valueMap.set(key, raw as FilterValue);
             }
             if (valueMap.size === 0) continue;
-
             const rawValues = Array.from(valueMap.values()) as (string | number | boolean)[];
             filters.push(new BasicFilter(target, "In", ...rawValues));
             sigParts.push(filterSignature(target, Array.from(valueMap.keys())));
         }
 
         if (filters.length === 0) return;
-
         const key = "BASIC|" + sigParts.slice().sort().join("|");
         if (key === this.lastFilterJson) return;
-
         this.lastFilterJson = key;
         this.host.applyJsonFilter(filters, "general", "filter", FilterAction.merge);
     }
@@ -590,42 +443,36 @@ export class Visual implements IVisual {
         this.hasAppliedFilter = false;
     }
 
-    /** 外部 BasicFilter を受信して行選択を復元（AdvancedFilter は filterCondition 側の責務なので無視） */
-    private restoreFromJsonFilters(jsonFilters: powerbi.IFilter[] | undefined, dv: DataView): boolean {
+    // ==========================================================
+    // 外部 jsonFilters 受信
+    // ==========================================================
+    private restoreFromJsonFilters(jsonFilters: powerbi.IFilter[] | undefined, dv: DataView | undefined): boolean {
         if (!jsonFilters || jsonFilters.length === 0) return false;
-
         const basic: IBasicFilter[] = [];
         for (const f of jsonFilters) {
             const ft = (f as unknown as { filterType?: FilterType })?.filterType;
             if (ft === FilterType.Basic) basic.push(f as unknown as IBasicFilter);
         }
         if (basic.length === 0) return false;
-        return this.restoreFromBasicFilters(basic, dv);
+        return this.restoreFromBasic(basic, dv);
     }
 
-    private restoreFromBasicFilters(basicFilters: IBasicFilter[], dv: DataView): boolean {
+    private restoreFromBasic(basicFilters: IBasicFilter[], dv: DataView | undefined): boolean {
         const cols = dv?.table?.columns || [];
-
         interface Parsed { colIdx: number; valueSet: Set<string>; sig: string; }
         const parsed: Parsed[] = [];
         for (const bf of basicFilters) {
             const tgt = bf.target as IFilterColumnTarget;
             const values = bf.values;
             if (!tgt || !values || values.length === 0) continue;
-
             let colIdx = -1;
             for (let i = 0; i < cols.length; i++) {
                 const t = buildFilterTarget(cols[i]);
                 if (t && t.table === tgt.table && t.column === tgt.column) { colIdx = i; break; }
             }
             if (colIdx < 0) continue;
-
             const normalized = values.map(v => normalizeValue(v));
-            parsed.push({
-                colIdx,
-                valueSet: new Set(normalized),
-                sig: filterSignature(tgt, normalized),
-            });
+            parsed.push({ colIdx, valueSet: new Set(normalized), sig: filterSignature(tgt, normalized) });
         }
         if (parsed.length === 0) return false;
 
@@ -641,15 +488,16 @@ export class Visual implements IVisual {
             }
             matched.add(i);
         });
-
         if (matched.size === 0) return false;
 
         this.selectedOrigIdx = matched;
         this.lastFilterJson = incomingKey;
 
-        const ids = Array.from(this.selectedOrigIdx)
-            .filter(i => i < this.selectionIds.length)
-            .map(i => this.selectionIds[i]);
+        const ids: ISelectionId[] = [];
+        for (const i of matched) {
+            const id = this.getSelectionId(i);
+            if (id) ids.push(id);
+        }
         if (ids.length > 0) {
             this.hasAppliedFilter = true;
             this.selectionManager.select(ids);
@@ -661,24 +509,21 @@ export class Visual implements IVisual {
     // ステータスバー
     // ==========================================================
     private renderStatus(): void {
-        this.clear(this.statusBar);
+        while (this.statusBar.firstChild) this.statusBar.removeChild(this.statusBar.firstChild);
         const t = this.tableData.rows.length;
-        const countText = `${t} 件`;
-
-        if (this.isLoadingMore) {
-            this.statusBar.appendChild(document.createTextNode(`${countText}（読み込み中…）`));
-        } else if (this.dataLimitReached) {
-            this.statusBar.appendChild(document.createTextNode(`${countText}（データ制限到達）`));
-        } else {
-            this.statusBar.appendChild(document.createTextNode(countText));
-        }
+        let text = `${t} 件`;
+        if (this.isLoadingMore) text += "（読み込み中…）";
+        else if (this.dataLimitReached) text += "（データ制限到達）";
+        this.statusBar.appendChild(document.createTextNode(text));
 
         const selSize = this.selectedOrigIdx.size;
         if (selSize > 0) {
-            const info = this.el("span", "sel-info");
+            const info = document.createElement("span");
+            info.className = "sel-info";
             info.textContent = `　${selSize} 件選択中`;
             this.statusBar.appendChild(info);
-            const clr = this.el("button", "clear-sel-btn");
+            const clr = document.createElement("button");
+            clr.className = "clear-sel-btn";
             clr.textContent = "選択解除";
             clr.onclick = () => this.clearSelection();
             this.statusBar.appendChild(clr);
@@ -686,53 +531,15 @@ export class Visual implements IVisual {
     }
 
     // ==========================================================
-    // 列幅リサイズ
+    // 書式適用
     // ==========================================================
-    private onColResizeStart(e: MouseEvent, colIdx: number): void {
-        e.preventDefault();
-        e.stopPropagation();
-        const startX = e.clientX;
-
-        const ths = this.thead.querySelectorAll("th");
-        let visIdx = 0;
-        for (let i = 0; i < this.tableData.columns.length; i++) {
-            if (!this.isColVisible(i)) continue;
-            if (i === colIdx) break;
-            visIdx++;
-        }
-        const thEl = ths[visIdx + 1] as HTMLElement;
-        const startW = thEl ? thEl.getBoundingClientRect().width : 80;
-
-        const colEls = this.colGroup.querySelectorAll("col");
-        const colEl = colEls[visIdx + 1] as HTMLElement;
-
-        const onMove = (ev: MouseEvent) => {
-            const newW = Math.max(40, startW + ev.clientX - startX);
-            if (colEl) colEl.style.width = newW + "px";
-            this.colWidths.set(colIdx, newW);
-        };
-
-        const onUp = () => {
-            document.removeEventListener("mousemove", onMove);
-            document.removeEventListener("mouseup", onUp);
-            this.rootEl.classList.remove("col-resizing");
-        };
-
-        this.rootEl.classList.add("col-resizing");
-        document.addEventListener("mousemove", onMove);
-        document.addEventListener("mouseup", onUp);
-    }
-
-    // ==========================================================
-    // 書式設定の適用
-    // ==========================================================
-    private applyTableStyles(): void {
+    private applyStyles(): void {
         if (!this.formattingSettings) return;
         const v = this.formattingSettings.valuesCard;
         const h = this.formattingSettings.columnHeaderCard;
         const s = this.rootEl.style;
-
         const vSize = v.font.fontSize.value;
+
         s.setProperty("--val-font-family", v.font.fontFamily.value);
         s.setProperty("--val-font-size", vSize + "pt");
         s.setProperty("--val-font-weight", v.font.bold.value ? "bold" : "normal");
@@ -743,9 +550,7 @@ export class Visual implements IVisual {
         s.setProperty("--val-alt-color", v.altFontColor.value.value);
         s.setProperty("--val-alt-bg", v.altBackgroundColor.value.value);
         s.setProperty("--val-white-space", v.wordWrap.value ? "pre-line" : "nowrap");
-
-        const rh = Math.max(24, Math.round(vSize * 1.333 * 1.6 + 4));
-        s.setProperty("--val-row-height", rh + "px");
+        s.setProperty("--val-row-height", Math.max(24, Math.round(vSize * 1.333 * 1.6 + 4)) + "px");
 
         s.setProperty("--hdr-font-family", h.font.fontFamily.value);
         s.setProperty("--hdr-font-size", h.font.fontSize.value + "pt");
@@ -757,9 +562,7 @@ export class Visual implements IVisual {
     }
 
     public getFormattingModel(): powerbi.visuals.FormattingModel {
-        if (!this.formattingSettings) {
-            this.formattingSettings = new VisualFormattingSettingsModel();
-        }
+        if (!this.formattingSettings) this.formattingSettings = new VisualFormattingSettingsModel();
         return this.formattingSettingsService.buildFormattingModel(this.formattingSettings);
     }
 
