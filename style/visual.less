@@ -15,63 +15,6 @@
         user-select: none;
     }
 
-    // ----- フィルターパネル -----
-    .filter-panel {
-        flex: 0 0 auto;
-        padding: 8px 10px 6px;
-        border-bottom: 1px solid #e0e0e0;
-        background: #f9f9f9;
-
-        .filter-header {
-            display: flex;
-            align-items: center;
-            gap: 4px;
-            margin-bottom: 6px;
-            flex-wrap: wrap;
-
-            .filter-title { font-weight: 600; font-size: 13px; color: #605e5c; }
-
-            .filter-help {
-                flex: 1 1 auto;
-                min-width: 0;
-                font-size: 11px;
-                color: #a19f9d;
-                cursor: help;
-                user-select: none;
-                overflow: hidden;
-                text-overflow: ellipsis;
-                white-space: nowrap;
-                &:hover { color: #0078d4; }
-            }
-        }
-
-        .search-row {
-            display: flex; align-items: center; gap: 4px;
-
-            .search-input {
-                flex: 1;
-                height: 28px; padding: 2px 8px;
-                border: 1px solid #c8c8c8; border-radius: 3px;
-                font-size: 12px; color: #252423; background: #fff; outline: none;
-                &:focus { border-color: #0078d4; box-shadow: 0 0 0 1px #0078d4; }
-            }
-
-            .clear-btn {
-                flex: 0 0 28px; width: 28px; height: 28px; padding: 0;
-                border: 1px solid #c8c8c8; border-radius: 3px;
-                background: #fff; color: #605e5c; cursor: pointer; font-size: 14px;
-                display: flex; align-items: center; justify-content: center;
-                &:hover { background: #f0f0f0; color: #252423; }
-            }
-        }
-
-        .filter-note {
-            font-size: 11px;
-            color: #888;
-            margin-top: 4px;
-        }
-    }
-
     // ----- 列トグルバー -----
     .col-toggle-bar {
         flex: 0 0 auto;

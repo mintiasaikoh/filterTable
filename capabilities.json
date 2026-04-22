@@ -36,26 +36,6 @@
                 "fontColor": { "type": { "fill": { "solid": { "color": true } } } },
                 "backgroundColor": { "type": { "fill": { "solid": { "color": true } } } }
             }
-        },
-        "filterState": {
-            "properties": {
-                "conditions": {
-                    "displayName": "フィルター条件",
-                    "type": { "text": true }
-                },
-                "logic": {
-                    "displayName": "論理演算子",
-                    "type": { "text": true }
-                },
-                "applied": {
-                    "displayName": "適用済み条件",
-                    "type": { "text": true }
-                },
-                "appliedLogic": {
-                    "displayName": "適用済み論理演算子",
-                    "type": { "text": true }
-                }
-            }
         }
     },
     "dataViewMappings": [

@@ -35,8 +35,6 @@ export class Visual implements IVisual {
     private formattingSettingsService: FormattingSettingsService;
 
     // ---- データ状態 ----
-    private searchText: string                   = "";
-    private appliedSearchText: string            = "";
     private tableData: TableData                 = { columns: [], rows: [], rawRows: [] };
     private filteredRows: string[][]             = [];
     private filteredOrigIdx: number[]            = [];
@@ -49,8 +47,6 @@ export class Visual implements IVisual {
     private prevColKey    = "";
 
     // ---- DOM ----
-    private filterPanel:  HTMLElement;
-    private searchInput:  HTMLInputElement;
     private colToggleBar: HTMLElement;
     private statusBar:    HTMLElement;
     private tableWrapper: HTMLElement;
@@ -65,10 +61,8 @@ export class Visual implements IVisual {
     private hasAppliedFilter  = false;
     private isLoadingMore     = false;
     private dataLimitReached  = false;
-    private persistTimer: number | null = null;
     private scrollRaf:    number | null = null;
     private emitTimer: number | null = null;
-    private searchDebounceTimer: number | null = null;
     private rootEl:       HTMLElement;
     private rowHeight     = ROW_H;
     private colWidths: Map<number, number> = new Map();
@@ -86,7 +80,6 @@ export class Visual implements IVisual {
     }
 
     private buildDOM(root: HTMLElement): void {
-        this.filterPanel  = this.el("div", "filter-panel");
         this.colToggleBar = this.el("div", "col-toggle-bar");
         this.statusBar    = this.el("div", "status-bar");
         this.tableWrapper = this.el("div", "table-wrapper");
@@ -102,7 +95,7 @@ export class Visual implements IVisual {
         this.scrollEl.appendChild(this.table);
         this.tableWrapper.appendChild(this.scrollEl);
 
-        [this.filterPanel, this.colToggleBar, this.statusBar, this.tableWrapper]
+        [this.colToggleBar, this.statusBar, this.tableWrapper]
             .forEach(e => root.appendChild(e));
 
         this.scrollEl.addEventListener("scroll", () => {
@@ -185,17 +178,12 @@ export class Visual implements IVisual {
             this.sortColIdx = -1;
             this.sortDir = null;
             this.lastClickedRi = -1;
-            this.searchText = "";
-            this.appliedSearchText = "";
             this.lastFilterJson = "";
             if (this.hasAppliedFilter) this.removeFilter();
             this.selectedOrigIdx.clear();
         }
 
         const isFirstLoad = !this.hasInteracted;
-        if (isFirstLoad || colsChanged) {
-            this.restoreState(dv);
-        }
 
         // jsonFilters から行選択を毎回再構築
         this.restoreFromJsonFilters(options.jsonFilters, dv);
@@ -212,23 +200,12 @@ export class Visual implements IVisual {
         }
 
         // --- レンダリング ---
-        if (!this.filterPanel.querySelector(".search-input:focus")) {
-            this.renderFilterPanel();
-        }
         this.renderColToggleBar();
         this.runFilter();
         this.applyTableStyles();
         this.renderTableHeader();
         this.renderVirtualRows();
         this.renderStatus();
-    }
-
-    private restoreState(dv: DataView): void {
-        const m = dv?.metadata?.objects?.["filterState"];
-        this.searchText = String(m?.["searchText"] ?? "");
-        this.appliedSearchText = this.searchText;
-        // 行選択 (selectedOrigIdx) は永続化しない（RLS 原則）。
-        // 真実源は applyJsonFilter / options.jsonFilters。restoreFromJsonFilters で復元される。
     }
 
     private cellToString(v: PrimitiveValue): string {
@@ -262,71 +239,6 @@ export class Visual implements IVisual {
                 this.host.createSelectionIdBuilder().withTable(table, i).createSelectionId()
             );
         }
-    }
-
-    // ==========================================================
-    // 検索パネル（単一の検索ボックス / 全列 substring マッチ）
-    // ==========================================================
-    private renderFilterPanel(): void {
-        if (this.persistTimer !== null) { clearTimeout(this.persistTimer); this.persistTimer = null; }
-        this.clear(this.filterPanel);
-
-        const hdr = this.el("div", "filter-header");
-        const ttl = this.el("span", "filter-title");
-        ttl.textContent = "検索";
-        hdr.appendChild(ttl);
-
-        const help = this.el("span", "filter-help") as HTMLSpanElement;
-        help.textContent = "ⓘ";
-        help.title = "全列対象の部分一致（ローカル絞り込み）。条件フィルターは filterCondition ビジュアルを利用してください。";
-        hdr.appendChild(help);
-
-        this.filterPanel.appendChild(hdr);
-
-        const row = this.el("div", "search-row");
-        this.searchInput = this.el("input", "search-input") as HTMLInputElement;
-        this.searchInput.type = "text";
-        this.searchInput.placeholder = "全列を部分一致検索";
-        this.searchInput.value = this.searchText;
-        this.searchInput.oninput = () => {
-            this.searchText = this.searchInput.value;
-            if (this.searchDebounceTimer !== null) clearTimeout(this.searchDebounceTimer);
-            this.searchDebounceTimer = window.setTimeout(() => {
-                this.searchDebounceTimer = null;
-                this.applySearchLocally();
-            }, 150);
-        };
-        this.searchInput.onkeydown = (e: KeyboardEvent) => {
-            if (e.key === "Enter") {
-                if (this.searchDebounceTimer !== null) { clearTimeout(this.searchDebounceTimer); this.searchDebounceTimer = null; }
-                this.applySearchLocally();
-            }
-        };
-        row.appendChild(this.searchInput);
-
-        const clearBtn = this.el("button", "clear-btn") as HTMLButtonElement;
-        clearBtn.textContent = "×";
-        clearBtn.title = "検索解除";
-        clearBtn.onclick = () => {
-            this.searchText = "";
-            this.searchInput.value = "";
-            this.applySearchLocally();
-        };
-        row.appendChild(clearBtn);
-
-        this.filterPanel.appendChild(row);
-    }
-
-    private applySearchLocally(): void {
-        this.hasInteracted = true;
-        this.appliedSearchText = this.searchText;
-        this.lastClickedRi = -1;
-        this.runFilter();
-        this.scrollEl.scrollTop = 0;
-        this.renderTableHeader();
-        this.renderVirtualRows();
-        this.renderStatus();
-        this.debounceSave();
     }
 
     // ==========================================================
@@ -364,24 +276,11 @@ export class Visual implements IVisual {
     }
 
     // ==========================================================
-    // ローカル絞り込み（全列 substring）
+    // 行並び替え
     // ==========================================================
     private runFilter(): void {
-        this.filteredRows = []; this.filteredOrigIdx = [];
-        const q = this.appliedSearchText.trim().toLowerCase();
-
-        if (!q) {
-            this.filteredRows    = this.tableData.rows.slice();
-            this.filteredOrigIdx = this.tableData.rows.map((_, i) => i);
-        } else {
-            this.tableData.rows.forEach((row, oi) => {
-                let hit = false;
-                for (let ci = 0; ci < row.length; ci++) {
-                    if ((row[ci] ?? "").toLowerCase().includes(q)) { hit = true; break; }
-                }
-                if (hit) { this.filteredRows.push(row); this.filteredOrigIdx.push(oi); }
-            });
-        }
+        this.filteredRows    = this.tableData.rows.slice();
+        this.filteredOrigIdx = this.tableData.rows.map((_, i) => i);
         this.applySort();
         this.liftSelectedToTop();
     }
@@ -783,24 +682,6 @@ export class Visual implements IVisual {
         return true;
     }
 
-    private updateSelectionUI(): void {
-        this.tbody.querySelectorAll("tr[data-ri]").forEach((el: Element) => {
-            const ri  = parseInt((el as HTMLElement).dataset.ri, 10);
-            const oi  = this.filteredOrigIdx[ri];
-            const sel = this.selectedOrigIdx.has(oi);
-            const cb  = el.querySelector("input") as HTMLInputElement;
-            if (cb) cb.checked = sel;
-            (el as HTMLElement).classList.toggle("row-selected", sel);
-        });
-        const allCb = this.thead.querySelector("input") as HTMLInputElement;
-        if (allCb) {
-            const allSel = this.filteredOrigIdx.length > 0
-                && this.filteredOrigIdx.every(i => this.selectedOrigIdx.has(i));
-            const someSel = !allSel && this.filteredOrigIdx.some(i => this.selectedOrigIdx.has(i));
-            allCb.checked = allSel; allCb.indeterminate = someSel;
-        }
-    }
-
     // ==========================================================
     // ステータスバー
     // ==========================================================
@@ -900,22 +781,6 @@ export class Visual implements IVisual {
         s.setProperty("--hdr-bg", h.backgroundColor.value.value);
     }
 
-    // ==========================================================
-    // Persist
-    // ==========================================================
-    private debounceSave(): void {
-        if (this.persistTimer !== null) clearTimeout(this.persistTimer);
-        this.persistTimer = window.setTimeout(() => { this.persistTimer = null; this.persist(); }, 800);
-    }
-
-    private persist(): void {
-        this.hasInteracted = true;
-        // 検索語のみ永続化（行選択は真実源 = jsonFilters で復元）
-        this.host.persistProperties({ merge: [{ objectName: "filterState", selector: null, properties: {
-            searchText: this.searchText,
-        }}]});
-    }
-
     public getFormattingModel(): powerbi.visuals.FormattingModel {
         if (!this.formattingSettings) {
             this.formattingSettings = new VisualFormattingSettingsModel();
@@ -924,8 +789,7 @@ export class Visual implements IVisual {
     }
 
     public destroy(): void {
-        if (this.persistTimer !== null) { clearTimeout(this.persistTimer); this.persistTimer = null; }
         if (this.scrollRaf !== null) { cancelAnimationFrame(this.scrollRaf); this.scrollRaf = null; }
-        if (this.searchDebounceTimer !== null) { clearTimeout(this.searchDebounceTimer); this.searchDebounceTimer = null; }
+        if (this.emitTimer !== null) { clearTimeout(this.emitTimer); this.emitTimer = null; }
     }
 }
