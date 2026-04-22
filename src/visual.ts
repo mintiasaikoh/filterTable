@@ -26,9 +26,6 @@ import {
     normalizeValue, filterSignature, buildFilterTarget,
 } from "./filterEngine";
 
-const ROW_H  = 24;   // px（tbody 行の高さ）
-const BUFFER = 8;    // ビューポート外に余分に描画しておく行数
-
 export class Visual implements IVisual {
     private host: IVisualHost;
     private formattingSettings: VisualFormattingSettingsModel;
@@ -36,9 +33,9 @@ export class Visual implements IVisual {
 
     // ---- データ状態 ----
     private tableData: TableData                 = { columns: [], rows: [], rawRows: [] };
-    private filteredRows: string[][]             = [];
-    private filteredOrigIdx: number[]            = [];
+    private sortedOrigIdx: number[]              = []; // ソート後の元行 index 配列（全行）
     private selectedOrigIdx: Set<number>         = new Set();
+    private rowNodes: Map<number, HTMLTableRowElement> = new Map(); // oi -> tr
     private selectionIds: ISelectionId[]         = [];
     private selectionManager: ISelectionManager;
     private lastDataView: DataView | null        = null;
@@ -61,10 +58,8 @@ export class Visual implements IVisual {
     private hasAppliedFilter  = false;
     private isLoadingMore     = false;
     private dataLimitReached  = false;
-    private scrollRaf:    number | null = null;
     private emitTimer: number | null = null;
     private rootEl:       HTMLElement;
-    private rowHeight     = ROW_H;
     private colWidths: Map<number, number> = new Map();
     private sortColIdx = -1;
     private sortDir: "asc" | "desc" | null = null;
@@ -97,14 +92,6 @@ export class Visual implements IVisual {
 
         [this.colToggleBar, this.statusBar, this.tableWrapper]
             .forEach(e => root.appendChild(e));
-
-        this.scrollEl.addEventListener("scroll", () => {
-            if (this.scrollRaf !== null) cancelAnimationFrame(this.scrollRaf);
-            this.scrollRaf = requestAnimationFrame(() => {
-                this.scrollRaf = null;
-                this.renderVirtualRows();
-            });
-        });
     }
 
     private el<K extends keyof HTMLElementTagNameMap>(tag: K, cls: string): HTMLElementTagNameMap[K] {
@@ -126,16 +113,11 @@ export class Visual implements IVisual {
 
         const hasResize = !!(options.type & VisualUpdateType.Resize);
         const hasDataOrStyle = !!(options.type & (VisualUpdateType.Data | VisualUpdateType.Style));
-        if (hasResize && !hasDataOrStyle) {
-            this.renderVirtualRows();
-            return;
-        }
+        if (hasResize && !hasDataOrStyle) return;
 
         if (!(options.type & VisualUpdateType.Data)) {
             if (options.type & VisualUpdateType.Style) {
                 this.applyTableStyles();
-                this.renderTableHeader();
-                this.renderVirtualRows();
             }
             return;
         }
@@ -162,8 +144,7 @@ export class Visual implements IVisual {
         }
 
         if (isSegment && this.isLoadingMore) {
-            // 中間チャンクは runFilter だけ（DOM 再構築は抑制）
-            this.runFilter();
+            // 中間チャンクは status のみ更新
             this.renderStatus();
             return;
         }
@@ -200,11 +181,11 @@ export class Visual implements IVisual {
         }
 
         // --- レンダリング ---
+        this.applySort();
         this.renderColToggleBar();
-        this.runFilter();
         this.applyTableStyles();
         this.renderTableHeader();
-        this.renderVirtualRows();
+        this.renderAllRows();
         this.renderStatus();
     }
 
@@ -268,7 +249,7 @@ export class Visual implements IVisual {
         this.activeColTab = idx;
         this.renderColToggleBar();
         this.renderTableHeader();
-        this.renderVirtualRows();
+        this.renderAllRows();
     }
 
     private isColVisible(i: number): boolean {
@@ -276,37 +257,13 @@ export class Visual implements IVisual {
     }
 
     // ==========================================================
-    // 行並び替え
+    // ソート
     // ==========================================================
-    private runFilter(): void {
-        this.filteredRows    = this.tableData.rows.slice();
-        this.filteredOrigIdx = this.tableData.rows.map((_, i) => i);
-        this.applySort();
-        this.liftSelectedToTop();
-    }
-
-    /** 選択行を stable に最上位へ（選択内は元順維持） */
-    private liftSelectedToTop(): void {
-        if (this.selectedOrigIdx.size === 0) return;
-        const selRows: string[][] = [];
-        const selIdx: number[] = [];
-        const restRows: string[][] = [];
-        const restIdx: number[] = [];
-        for (let i = 0; i < this.filteredOrigIdx.length; i++) {
-            const oi = this.filteredOrigIdx[i];
-            if (this.selectedOrigIdx.has(oi)) {
-                selRows.push(this.filteredRows[i]);
-                selIdx.push(oi);
-            } else {
-                restRows.push(this.filteredRows[i]);
-                restIdx.push(oi);
-            }
-        }
-        this.filteredRows    = selRows.concat(restRows);
-        this.filteredOrigIdx = selIdx.concat(restIdx);
-    }
-
     private applySort(): void {
+        const n = this.tableData.rows.length;
+        this.sortedOrigIdx = new Array(n);
+        for (let i = 0; i < n; i++) this.sortedOrigIdx[i] = i;
+
         if (this.sortColIdx < 0 || !this.sortDir) return;
         const ci = this.sortColIdx;
         const dir = this.sortDir === "asc" ? 1 : -1;
@@ -318,24 +275,20 @@ export class Visual implements IVisual {
             if (typeof raw === "number") return raw;
             if (typeof raw === "boolean") return raw ? 1 : 0;
             const s = String(raw);
-            const n = Number(s);
-            return (s !== "" && !isNaN(n)) ? n : s;
+            const nu = Number(s);
+            return (s !== "" && !isNaN(nu)) ? nu : s;
         };
 
-        const indices = this.filteredOrigIdx.map((_, i) => i);
-        indices.sort((a, b) => {
-            const ka = keyOf(this.filteredOrigIdx[a]);
-            const kb = keyOf(this.filteredOrigIdx[b]);
+        this.sortedOrigIdx.sort((a, b) => {
+            const ka = keyOf(a);
+            const kb = keyOf(b);
             if (typeof ka === "number" && typeof kb === "number") return (ka - kb) * dir;
             return String(ka).localeCompare(String(kb), undefined, { numeric: true }) * dir;
         });
-
-        this.filteredRows    = indices.map(i => this.filteredRows[i]);
-        this.filteredOrigIdx = indices.map(i => this.filteredOrigIdx[i]);
     }
 
     // ==========================================================
-    // テーブル描画（DOM仮想スクロール）
+    // テーブル描画（全行一括 / ブラウザ標準スクロール）
     // ==========================================================
     private renderTableHeader(): void {
         this.clear(this.colGroup);
@@ -355,9 +308,9 @@ export class Visual implements IVisual {
         const tr = this.el("tr", "");
 
         const cbTh = this.el("th", "cb-col");
-        const allSel = this.filteredOrigIdx.length > 0
-            && this.filteredOrigIdx.every(i => this.selectedOrigIdx.has(i));
-        const someSel = !allSel && this.filteredOrigIdx.some(i => this.selectedOrigIdx.has(i));
+        const total = this.sortedOrigIdx.length;
+        const allSel = total > 0 && this.selectedOrigIdx.size === total;
+        const someSel = !allSel && this.selectedOrigIdx.size > 0;
         const allCb = this.el("input", "") as HTMLInputElement;
         allCb.type = "checkbox"; allCb.checked = allSel; allCb.indeterminate = someSel;
         allCb.onchange = () => this.toggleSelectAll();
@@ -388,9 +341,9 @@ export class Visual implements IVisual {
                     this.sortDir = "asc";
                 }
                 this.lastClickedRi = -1;
-                this.runFilter();
+                this.applySort();
                 this.renderTableHeader();
-                this.renderVirtualRows();
+                this.renderAllRows();
             });
 
             const handle = this.el("div", "col-resize-handle");
@@ -413,13 +366,12 @@ export class Visual implements IVisual {
         }
     }
 
-    private renderVirtualRows(): void {
-        const scrollTop = this.scrollEl.scrollTop;
-        const viewH     = this.scrollEl.clientHeight;
-        const total     = this.filteredRows.length;
+    private renderAllRows(): void {
+        this.clear(this.tbody);
+        this.rowNodes.clear();
 
+        const total = this.sortedOrigIdx.length;
         if (total === 0) {
-            this.clear(this.tbody);
             const tr = this.el("tr", ""); const td = this.el("td", "no-data") as HTMLTableCellElement;
             const visCols = this.tableData.columns.filter((_, i) => this.isColVisible(i)).length;
             td.colSpan = visCols + 1;
@@ -430,36 +382,15 @@ export class Visual implements IVisual {
             return;
         }
 
-        const rh = this.rowHeight;
-        const isWordWrap = this.formattingSettings?.valuesCard?.wordWrap?.value ?? false;
-        const buf = isWordWrap ? BUFFER * 4 : BUFFER;
-        const startRow = Math.max(0, Math.floor(scrollTop / rh) - buf);
-        const endRow   = Math.min(total, startRow + Math.ceil(viewH / rh) + buf * 2);
-        const beforeH  = startRow * rh;
-        const afterH   = Math.max(0, (total - endRow) * rh);
-        const span     = this.tableData.columns.filter((_, i) => this.isColVisible(i)).length + 1;
-
-        this.clear(this.tbody);
         const frag = document.createDocumentFragment();
-
-        if (beforeH > 0) frag.appendChild(this.makeSpacerRow(beforeH, span));
-        for (let ri = startRow; ri < endRow; ri++) frag.appendChild(this.makeDataRow(ri));
-        if (afterH  > 0) frag.appendChild(this.makeSpacerRow(afterH,  span));
-
+        for (let ri = 0; ri < total; ri++) {
+            frag.appendChild(this.makeDataRow(ri));
+        }
         this.tbody.appendChild(frag);
     }
 
-    private makeSpacerRow(h: number, span: number): HTMLTableRowElement {
-        const tr = this.el("tr", "spacer-row") as HTMLTableRowElement;
-        const td = this.el("td", "") as HTMLTableCellElement;
-        td.colSpan = span; td.style.height = h + "px";
-        td.style.padding = "0"; td.style.border = "none";
-        tr.appendChild(td);
-        return tr;
-    }
-
     private makeDataRow(ri: number): HTMLTableRowElement {
-        const oi  = this.filteredOrigIdx[ri];
+        const oi  = this.sortedOrigIdx[ri];
         const sel = this.selectedOrigIdx.has(oi);
         const tr  = this.el("tr", ri % 2 === 0 ? "row-even" : "row-odd") as HTMLTableRowElement;
         tr.dataset.ri = String(ri);
@@ -475,13 +406,15 @@ export class Visual implements IVisual {
             this.handleRowClick(ri, e);
         });
 
-        const row = this.filteredRows[ri];
+        const row = this.tableData.rows[oi];
         this.tableData.columns.forEach((_, i) => {
             if (!this.isColVisible(i)) return;
             const td = this.el("td", i === 0 ? "first-data-col" : "") as HTMLTableCellElement;
             td.textContent = row[i] ?? "";
             tr.appendChild(td);
         });
+
+        this.rowNodes.set(oi, tr);
         return tr;
     }
 
@@ -489,54 +422,96 @@ export class Visual implements IVisual {
     // 選択
     // ==========================================================
     private handleRowClick(ri: number, e: MouseEvent): void {
-        if (ri >= this.filteredOrigIdx.length) return;
-        const oi = this.filteredOrigIdx[ri];
+        if (ri >= this.sortedOrigIdx.length) return;
+        const oi = this.sortedOrigIdx[ri];
         const ctrlOrMeta = e.ctrlKey || e.metaKey;
+
+        const changed = new Set<number>();
+        const markChange = (i: number) => changed.add(i);
 
         if (e.shiftKey && this.lastClickedRi >= 0) {
             const from = Math.min(this.lastClickedRi, ri);
             const to   = Math.max(this.lastClickedRi, ri);
-            if (!ctrlOrMeta) this.selectedOrigIdx.clear();
+            if (!ctrlOrMeta) {
+                this.selectedOrigIdx.forEach(i => markChange(i));
+                this.selectedOrigIdx.clear();
+            }
             for (let r = from; r <= to; r++) {
-                this.selectedOrigIdx.add(this.filteredOrigIdx[r]);
+                const i = this.sortedOrigIdx[r];
+                if (!this.selectedOrigIdx.has(i)) {
+                    this.selectedOrigIdx.add(i);
+                    markChange(i);
+                }
             }
         } else if (ctrlOrMeta) {
             if (this.selectedOrigIdx.has(oi)) this.selectedOrigIdx.delete(oi);
             else this.selectedOrigIdx.add(oi);
+            markChange(oi);
         } else {
             const onlyThis = this.selectedOrigIdx.size === 1 && this.selectedOrigIdx.has(oi);
+            this.selectedOrigIdx.forEach(i => markChange(i));
             this.selectedOrigIdx.clear();
-            if (!onlyThis) this.selectedOrigIdx.add(oi);
+            if (!onlyThis) {
+                this.selectedOrigIdx.add(oi);
+                markChange(oi);
+            }
         }
 
+        this.lastClickedRi = ri;
+        this.updateRowsUI(changed);
         this.commitSelection();
-        // 並び替え後に同じ行を指す ri を再取得
-        this.lastClickedRi = this.filteredOrigIdx.indexOf(oi);
     }
 
     private toggleSelectAll(): void {
-        if (this.filteredOrigIdx.length === 0) return;
-        const allSel = this.filteredOrigIdx.every(i => this.selectedOrigIdx.has(i));
-        this.filteredOrigIdx.forEach(i =>
-            allSel ? this.selectedOrigIdx.delete(i) : this.selectedOrigIdx.add(i)
-        );
+        const total = this.sortedOrigIdx.length;
+        if (total === 0) return;
+        const allSel = this.selectedOrigIdx.size === total;
+        const changed = new Set<number>();
+        if (allSel) {
+            this.selectedOrigIdx.forEach(i => changed.add(i));
+            this.selectedOrigIdx.clear();
+        } else {
+            for (const i of this.sortedOrigIdx) {
+                if (!this.selectedOrigIdx.has(i)) {
+                    this.selectedOrigIdx.add(i);
+                    changed.add(i);
+                }
+            }
+        }
+        this.updateRowsUI(changed);
         this.commitSelection();
     }
 
     private clearSelection(): void {
+        const changed = new Set<number>(this.selectedOrigIdx);
         this.selectedOrigIdx.clear();
+        this.updateRowsUI(changed);
         this.commitSelection();
+    }
+
+    /** 指定 oi の行だけ class/checkbox を更新 + header allSelect 状態を更新 */
+    private updateRowsUI(changedOi: Set<number>): void {
+        changedOi.forEach(oi => {
+            const tr = this.rowNodes.get(oi);
+            if (!tr) return;
+            const sel = this.selectedOrigIdx.has(oi);
+            tr.classList.toggle("row-selected", sel);
+            const cb = tr.querySelector("input") as HTMLInputElement;
+            if (cb) cb.checked = sel;
+        });
+        const allCb = this.thead.querySelector("input") as HTMLInputElement;
+        if (allCb) {
+            const total = this.sortedOrigIdx.length;
+            const allSel = total > 0 && this.selectedOrigIdx.size === total;
+            const someSel = !allSel && this.selectedOrigIdx.size > 0;
+            allCb.checked = allSel;
+            allCb.indeterminate = someSel;
+        }
     }
 
     private commitSelection(): void {
         this.hasInteracted = true;
         this.applyDatasetFilter();
-        // 選択行を最上位へ並べ替え直す
-        this.runFilter();
-        // 並べ替えた結果を実際に見える位置（最上段）へスクロールリセット
-        if (this.scrollEl) this.scrollEl.scrollTop = 0;
-        this.renderTableHeader();
-        this.renderVirtualRows();
         this.renderStatus();
     }
 
@@ -687,8 +662,8 @@ export class Visual implements IVisual {
     // ==========================================================
     private renderStatus(): void {
         this.clear(this.statusBar);
-        const f = this.filteredRows.length, t = this.tableData.rows.length;
-        const countText = f === t ? `${t} 件` : `${f} / ${t} 件`;
+        const t = this.tableData.rows.length;
+        const countText = `${t} 件`;
 
         if (this.isLoadingMore) {
             this.statusBar.appendChild(document.createTextNode(`${countText}（読み込み中…）`));
@@ -769,8 +744,8 @@ export class Visual implements IVisual {
         s.setProperty("--val-alt-bg", v.altBackgroundColor.value.value);
         s.setProperty("--val-white-space", v.wordWrap.value ? "pre-line" : "nowrap");
 
-        this.rowHeight = Math.max(ROW_H, Math.round(vSize * 1.333 * 1.6 + 4));
-        s.setProperty("--val-row-height", this.rowHeight + "px");
+        const rh = Math.max(24, Math.round(vSize * 1.333 * 1.6 + 4));
+        s.setProperty("--val-row-height", rh + "px");
 
         s.setProperty("--hdr-font-family", h.font.fontFamily.value);
         s.setProperty("--hdr-font-size", h.font.fontSize.value + "pt");
@@ -789,7 +764,6 @@ export class Visual implements IVisual {
     }
 
     public destroy(): void {
-        if (this.scrollRaf !== null) { cancelAnimationFrame(this.scrollRaf); this.scrollRaf = null; }
         if (this.emitTimer !== null) { clearTimeout(this.emitTimer); this.emitTimer = null; }
     }
 }
